@@ -49,6 +49,7 @@ from humble_dl.services.books import (
     BooksReport,
     import_books,
 )
+from humble_dl.services.books_library import library_duplicates_report
 from humble_dl.services.planner import ArchiveThenFetch
 from humble_dl.services.sync import (
     InsufficientSpaceError,
@@ -95,7 +96,8 @@ MSG_FAILED_BUNDLES = "{count} bundle(s) could not be loaded:"
 MSG_UNSIGNED_FILES = "{count} file(s) had no download link:"
 MSG_BOOKS_SUMMARY = (
     "selected {selected}, already imported {already}, imported {imported}, "
-    "changed {changed}, failed {failed}"
+    "changed {changed}, failed {failed}, duplicate in another bundle {duplicates}, "
+    "already in Books {in_books}"
 )
 MSG_BOOKS_FAILED = "{count} file(s) failed to import into Books:"
 UNKNOWN_SIZE = "size unknown"
@@ -337,11 +339,24 @@ def _report_books(report: BooksReport, dry_run: bool) -> None:
                 imported=report.imported,
                 changed=report.changed,
                 failed=len(report.failed),
+                duplicates=report.duplicates,
+                in_books=report.in_books,
             )
         )
     if report.failed:
         listing = "\n".join(f"  {path}" for path in report.failed)
         raise BooksFailedError(f"{MSG_BOOKS_FAILED.format(count=len(report.failed))}\n{listing}")
+
+
+def _duplicates_body() -> None:
+    for line in library_duplicates_report(BOOKS_DEPS().library_dir):
+        typer.echo(line)
+
+
+@app.command("books-duplicates")
+def books_duplicates() -> None:
+    """Report books held more than once in Apple Books (read-only)."""
+    _run("books-duplicates", _duplicates_body)
 
 
 @app.command()

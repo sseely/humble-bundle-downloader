@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -21,12 +21,19 @@ from pydantic import BaseModel, ConfigDict, StrictInt, ValidationError
 
 from humble_dl.config import ConfigError, Settings
 from humble_dl.lib.logging import FILE_NAME_KEY, get_logger
+from humble_dl.services.books_library import (
+    HIDDEN_PREFIX,
+    PREFERRED_SUFFIXES,
+    default_library_dir,
+    keys_for_selection,
+    library_keys,
+    partition,
+    read_library_names,
+)
 
 DARWIN = "darwin"
 OPEN_COMMAND = ("open", "-a", "Books")
 OPEN_TIMEOUT_S = 120.0
-PREFERRED_SUFFIXES = (".epub", ".pdf")
-HIDDEN_PREFIX = "."
 
 DEFAULT_BATCH = 10
 MIN_BATCH = 1
@@ -46,6 +53,8 @@ MSG_DRY_LINE = "{verb} {relative}"
 MSG_DRY_TOTAL = "Dry run: {count} files to import."
 VERB_IMPORT = "import"
 VERB_REIMPORT = "reimport"
+VERB_SKIP_DUPLICATE = "skip-duplicate"
+VERB_SKIP_IN_BOOKS = "skip-in-books"
 
 _ARCHIVED_STEM = re.compile(r"\.[0-9a-f]{8}$")
 
@@ -124,6 +133,7 @@ class BooksDeps:
     runner: Runner = run_open
     sleep: Sleeper = time.sleep
     platform: str = field(default_factory=lambda: sys.platform)
+    library_dir: Path | None = None  # None: default_library_dir() at call time
 
 
 @dataclass(frozen=True)
@@ -134,11 +144,14 @@ class BooksPlan:
     changed: tuple[Path, ...]
     already: tuple[Path, ...]
     stamps: Mapping[Path, FileStamp]
+    duplicates: tuple[Path, ...] = ()
+    in_books: tuple[Path, ...] = ()
 
     @property
     def selected(self) -> int:
-        """Total number of selected files."""
-        return len(self.new) + len(self.changed) + len(self.already)
+        """Total number of selected files, including skipped ones."""
+        kinds = (self.new, self.changed, self.already, self.duplicates, self.in_books)
+        return sum(len(kind) for kind in kinds)
 
     @property
     def to_import(self) -> list[Path]:
@@ -156,6 +169,8 @@ class BooksReport:
     changed: int
     failed: tuple[Path, ...]
     lines: tuple[str, ...] = ()
+    duplicates: int = 0
+    in_books: int = 0
 
 
 def validate_options(opts: BooksOptions) -> None:
@@ -245,6 +260,12 @@ def chunk(paths: Sequence[Path], size: int) -> list[list[Path]]:
     return [list(paths[i : i + size]) for i in range(0, len(paths), size)]
 
 
+def _skip_lines(verb: str, paths: Sequence[Path], output_dir: Path) -> list[str]:
+    return [
+        MSG_DRY_LINE.format(verb=verb, relative=p.relative_to(output_dir).as_posix()) for p in paths
+    ]
+
+
 def dry_run_lines(plan: BooksPlan, output_dir: Path) -> tuple[str, ...]:
     """One line per file that would be imported, then a total line."""
     changed = set(plan.changed)
@@ -255,6 +276,8 @@ def dry_run_lines(plan: BooksPlan, output_dir: Path) -> tuple[str, ...]:
         )
         for path in plan.to_import
     ]
+    lines.extend(_skip_lines(VERB_SKIP_DUPLICATE, plan.duplicates, output_dir))
+    lines.extend(_skip_lines(VERB_SKIP_IN_BOOKS, plan.in_books, output_dir))
     lines.append(MSG_DRY_TOTAL.format(count=len(plan.to_import)))
     return tuple(lines)
 
@@ -332,7 +355,20 @@ def _import_all(
         imported=len(done) - reimported,
         changed=reimported,
         failed=tuple(failed),
+        duplicates=len(plan.duplicates),
+        in_books=len(plan.in_books),
     )
+
+
+def _build_plan(
+    root: Path, opts: BooksOptions, state: Mapping[str, FileStamp], deps: BooksDeps
+) -> BooksPlan:
+    names = read_library_names(deps.library_dir or default_library_dir())
+    selected = select_books(root, opts.only)
+    keys = keys_for_selection(selected)
+    remaining, duplicates, in_books = partition(selected, keys, library_keys(names))
+    plan = classify(stat_stamps(remaining), state)
+    return replace(plan, duplicates=tuple(duplicates), in_books=tuple(in_books))
 
 
 def import_books(
@@ -360,9 +396,18 @@ def import_books(
     root = settings.output_dir.resolve()
     _log.info("books_started", extra={"dry_run": opts.dry_run, "only": opts.only})
     state = load_state(settings.books_state_path)
-    plan = classify(stat_stamps(select_books(root, opts.only)), state)
+    plan = _build_plan(root, opts, state, deps)
     if opts.dry_run:
-        return BooksReport(plan.selected, len(plan.already), 0, 0, (), dry_run_lines(plan, root))
+        return BooksReport(
+            plan.selected,
+            len(plan.already),
+            0,
+            0,
+            (),
+            dry_run_lines(plan, root),
+            len(plan.duplicates),
+            len(plan.in_books),
+        )
     report = _import_all(plan, state, settings.books_state_path, opts, deps)
     _log.info(
         "books_complete",
@@ -372,6 +417,8 @@ def import_books(
             "imported": report.imported,
             "changed": report.changed,
             "failed": len(report.failed),
+            "duplicates": report.duplicates,
+            "in_books": report.in_books,
         },
     )
     return report

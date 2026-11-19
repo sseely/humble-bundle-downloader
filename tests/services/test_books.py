@@ -17,9 +17,19 @@ from humble_dl.services.books import (
     BooksStateError,
     FileStamp,
 )
+from tests.helpers.books import make_epub, make_library
 
 OPEN_PREFIX = ["open", "-a", "Books"]
 PAUSE = 3.0
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point HOME at an empty dir so the default Books library path is never real."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
 
 
 class FakeRunner:
@@ -140,8 +150,8 @@ def test_save_state_failure_cleans_temp(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
     monkeypatch.setattr(os, "replace", boom)
     with pytest.raises(OSError, match="disk"):
-        books.save_state(tmp_path / "s.json", {})
-    assert list(tmp_path.iterdir()) == []
+        books.save_state(tmp_path / "state" / "s.json", {})
+    assert list((tmp_path / "state").iterdir()) == []
 
 
 @pytest.mark.parametrize(
@@ -176,8 +186,13 @@ def seed(settings: Settings, count: int = 5) -> list[Path]:
     return [touch(settings.output_dir / "B" / f"I{n}" / f"b{n}.epub") for n in range(count)]
 
 
-def deps_for(runner: FakeRunner, sleeps: list[float]) -> BooksDeps:
-    return BooksDeps(runner=runner, sleep=sleeps.append, platform="darwin")
+def deps_for(runner: FakeRunner, sleeps: list[float], library: Path | None = None) -> BooksDeps:
+    return BooksDeps(
+        runner=runner,
+        sleep=sleeps.append,
+        platform="darwin",
+        library_dir=library,
+    )
 
 
 def test_first_run_batches_then_second_run_skips(tmp_path: Path) -> None:
@@ -278,7 +293,11 @@ def test_dry_run_marks_reimport(tmp_path: Path) -> None:
     files = seed(settings, 2)
     books.import_books(settings, BooksOptions(pause=0), deps_for(FakeRunner(), list[float]()))
     files[0].write_text("changed!!")
-    report = books.import_books(settings, BooksOptions(dry_run=True))
+    report = books.import_books(
+        settings,
+        BooksOptions(dry_run=True),
+        BooksDeps(library_dir=tmp_path / "no-library", platform="linux"),
+    )
     assert report.lines == ("reimport B/I0/b0.epub", "Dry run: 1 files to import.")
 
 
@@ -312,3 +331,94 @@ def test_run_open_failure_returns_false(monkeypatch: pytest.MonkeyPatch, error: 
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert books.run_open(["open"]) is False
+
+
+def test_cross_bundle_duplicates_import_one_file(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    epub = touch(settings.output_dir / "B1" / "I" / "a.epub").resolve()
+    touch(settings.output_dir / "B2" / "J" / "A.pdf")
+    runner = FakeRunner()
+    report = books.import_books(settings, BooksOptions(pause=0), deps_for(runner, list[float]()))
+    assert runner.calls == [[*OPEN_PREFIX, str(epub)]]
+    assert (report.selected, report.imported, report.duplicates) == (2, 1, 1)
+
+
+def test_books_already_in_library_skipped_not_recorded(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    touch(settings.output_dir / "B" / "I" / "a.epub")
+    touch(settings.output_dir / "B" / "J" / "b.epub")
+    touch(settings.output_dir / "B" / "K" / "c.epub")
+    library = make_library(tmp_path / "lib", files=["a_1403628954.pdf"], dirs=["b.epub"])
+    runner = FakeRunner()
+    report = books.import_books(
+        settings, BooksOptions(pause=0), deps_for(runner, list[float](), library)
+    )
+    assert [Path(c[-1]).name for c in runner.calls] == ["c.epub"]
+    assert (report.selected, report.in_books, report.imported) == (3, 2, 1)
+    saved = json.loads(settings.books_state_path.read_text())["files"]
+    assert [Path(k).name for k in saved] == ["c.epub"]
+
+
+def test_missing_library_imports_normally(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    touch(settings.output_dir / "B" / "I" / "a.epub")
+    runner = FakeRunner()
+    report = books.import_books(
+        settings, BooksOptions(pause=0), deps_for(runner, list[float](), tmp_path / "none")
+    )
+    assert (report.imported, report.in_books) == (1, 0)
+
+
+def test_dry_run_lists_skip_lines(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    touch(settings.output_dir / "B1" / "I" / "a.epub")
+    touch(settings.output_dir / "B2" / "I" / "a.pdf")
+    touch(settings.output_dir / "B1" / "J" / "b.epub")
+    library = make_library(tmp_path / "lib", dirs=["b.epub"])
+    report = books.import_books(
+        settings,
+        BooksOptions(dry_run=True),
+        BooksDeps(library_dir=library, platform="linux"),
+    )
+    assert report.lines == (
+        "import B1/I/a.epub",
+        "skip-duplicate B2/I/a.pdf",
+        "skip-in-books B1/J/b.epub",
+        "Dry run: 1 files to import.",
+    )
+    assert (report.duplicates, report.in_books) == (1, 1)
+
+
+def test_title_match_skips_epub_already_in_books(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    make_epub(settings.output_dir / "B" / "I" / "redshirts_johnscalzi.epub", "Redshirts")
+    library = make_library(tmp_path / "lib", dirs=["Redshirts.epub"])
+    runner = FakeRunner()
+    report = books.import_books(
+        settings, BooksOptions(pause=0), deps_for(runner, list[float](), library)
+    )
+    assert (runner.calls, report.in_books, report.imported) == ([], 1, 0)
+    assert not settings.books_state_path.exists()
+
+
+def test_same_title_across_bundles_imports_once(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    first = make_epub(
+        settings.output_dir / "A" / "I" / "oldmanswar_johnscalzi.epub", "Old Man's War"
+    ).resolve()
+    make_epub(settings.output_dir / "B" / "J" / "old_mans_war.epub", "Old Man's War")
+    runner = FakeRunner()
+    report = books.import_books(settings, BooksOptions(pause=0), deps_for(runner, list[float]()))
+    assert runner.calls == [[*OPEN_PREFIX, str(first)]]
+    assert (report.imported, report.duplicates) == (1, 1)
+
+
+def test_pdf_collision_suffix_in_library_skips(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    touch(settings.output_dir / "B" / "I" / "foo.pdf")
+    library = make_library(tmp_path / "lib", files=["foo_1418163538.pdf"])
+    runner = FakeRunner()
+    report = books.import_books(
+        settings, BooksOptions(pause=0), deps_for(runner, list[float](), library)
+    )
+    assert (runner.calls, report.in_books) == ([], 1)

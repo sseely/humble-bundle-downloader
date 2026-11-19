@@ -48,6 +48,43 @@ and wait for the command to finish. The session is saved in
 > back it up to a shared location. Set `HUMBLE_DL_PROFILE_DIR` to keep it
 > elsewhere.
 
+## Apple Books (macOS)
+
+```bash
+uv run humble-dl books --dry-run       # list what would be sent to Books
+uv run humble-dl books                 # import new books into Apple Books
+uv run humble-dl books --only "scalzi" # only bundles whose folder name matches
+uv run humble-dl books-duplicates      # list books that are in Books more than once
+uv run humble-dl sync && uv run humble-dl books   # download, then import new books
+```
+
+`books` sends files to Apple Books with `open -a Books`, one file per book:
+
+- **Format:** the EPUB when an item has one, otherwise the PDF. MOBI files,
+  unfinished downloads and archived old versions are never sent.
+- **Overlapping bundles:** when the same book appears in several bundles, it
+  is sent once. Two files count as the same book when they share a file name,
+  an EPUB title or a Humble item title. Editions and store variants (Kindle,
+  Kobo, HQ, high/low) count as the same book.
+- **Already in Books:** books are skipped when they are already in Apple
+  Books' iCloud library
+  (`~/Library/Mobile Documents/iCloud~com~apple~iBooks/Documents`). That folder
+  names EPUBs by title and PDFs by file name. `books` only reads entry names
+  there and never changes anything.
+- **Never twice:** every import is recorded in
+  `~/.humble-dl/books-imported.json`, so a file is sent once. A changed file
+  (a new version) is sent again.
+
+Files go to Books in batches (`--batch`, default 10) with a pause between them
+(`--pause`, default 5 s). Progress is saved after each batch. A failed batch is
+listed, makes the command exit 4, and is retried on the next run.
+
+Books copies every imported file into its own library. With iCloud enabled for
+Books, imports also upload to iCloud and count against your storage.
+
+`books-duplicates` only reports. To remove an extra copy, use the Books app:
+right-click the book, then choose **Remove**, then **Remove Everywhere**.
+
 ## Folder layout
 
 For the bundle "Humble Book Bundle: The John Scalzi Collection: Old Man's

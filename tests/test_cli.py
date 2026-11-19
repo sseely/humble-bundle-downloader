@@ -421,14 +421,19 @@ class BooksRecorder:
         self.calls.append(list(argv))
         return len(self.calls) not in self.fail_on
 
-    def deps(self, platform: str = "darwin") -> BooksDeps:
-        return BooksDeps(runner=self, sleep=self.sleeps.append, platform=platform)
+    def deps(self, platform: str = "darwin", library: Path | None = None) -> BooksDeps:
+        return BooksDeps(
+            runner=self, sleep=self.sleeps.append, platform=platform, library_dir=library
+        )
 
 
 def install_books(
-    monkeypatch: pytest.MonkeyPatch, rec: BooksRecorder, platform: str = "darwin"
+    monkeypatch: pytest.MonkeyPatch,
+    rec: BooksRecorder,
+    platform: str = "darwin",
+    library: Path | None = None,
 ) -> None:
-    monkeypatch.setattr(cli, "BOOKS_DEPS", lambda: rec.deps(platform))
+    monkeypatch.setattr(cli, "BOOKS_DEPS", lambda: rec.deps(platform, library))
 
 
 def seed_books(out: Path, count: int) -> list[Path]:
@@ -541,3 +546,50 @@ def test_books_default_deps_are_real() -> None:
     deps = cli.BOOKS_DEPS()
     assert deps.runner is books_service.run_open
     assert deps.platform == sys.platform
+
+
+def test_books_summary_has_skip_counts_and_dry_run_lines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    out, library = tmp_path / "lib", tmp_path / "bks"
+    seed_books(out, 1)
+    other = out / "Other" / "Item" / "book0.pdf"
+    other.parent.mkdir(parents=True)
+    other.write_text("x")
+    (out / "Bundle" / "Item1" / "x.epub").parent.mkdir(parents=True)
+    (out / "Bundle" / "Item1" / "x.epub").write_text("x")
+    (library / "x.epub").mkdir(parents=True)
+    rec = BooksRecorder()
+    install_books(monkeypatch, rec, library=library)
+    dry = invoke("books", "--output", str(out), "--dry-run")
+    assert dry.stdout.splitlines() == [
+        "import Bundle/Item0/book0.epub",
+        "skip-duplicate Other/Item/book0.pdf",
+        "skip-in-books Bundle/Item1/x.epub",
+        "Dry run: 1 files to import.",
+    ]
+    result = invoke("books", "--output", str(out), "--pause", "0")
+    assert result.exit_code == cli.EXIT_OK
+    assert (
+        "selected 3, already imported 0, imported 1, changed 0, failed 0, "
+        "duplicate in another bundle 1, already in Books 1"
+    ) in result.stdout
+    assert len(rec.calls) == 1
+
+
+def test_books_duplicates_command_reports_and_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, isolated_home: Path
+) -> None:
+    library = tmp_path / "bks"
+    (library / "x.epub").mkdir(parents=True)
+    (library / "x_1234567890.pdf").write_text("x")
+    rec = BooksRecorder()
+    install_books(monkeypatch, rec, library=library)
+    result = invoke("books-duplicates")
+    assert result.exit_code == cli.EXIT_OK
+    assert result.stdout.splitlines() == [
+        "x.epub | x_1234567890.pdf",
+        "1 book(s) with more than one copy in Books.",
+    ]
+    assert rec.calls == []
+    assert not (isolated_home / ".humble-dl").exists()
