@@ -9,7 +9,7 @@ import asyncio
 import os
 import re
 import time
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Final, Protocol
@@ -30,6 +30,7 @@ from humble_dl.auth.session import (
 from humble_dl.config import Settings
 from humble_dl.lib.logging import get_logger, redact_url
 from humble_dl.models.library import (
+    EBOOK_PLATFORM,
     BundleRef,
     Order,
     SchemaDriftError,
@@ -75,6 +76,7 @@ KIND_LIBRARY: Final = "library"
 KIND_BUNDLE: Final = "bundle"
 KIND_SIGNED: Final = "signed-urls"
 DEBUG_FILE_MODE: Final = 0o600
+MISSING_LOG_LIMIT: Final = 20
 DEBUG_TS_FORMAT: Final = "%Y%m%dT%H%M%S%fZ"
 
 _log = get_logger(__name__)
@@ -147,6 +149,29 @@ def classify_action(status: int, body: str) -> ActionVerdict:
 def backoff_delay(attempt: int) -> float:
     """Delay in seconds after failed ``attempt`` (1-based): 1, 2, 4, 8."""
     return BACKOFF_BASE_S * BACKOFF_FACTOR ** (attempt - 1)
+
+
+def describe_missing(
+    order: Order, signed: Mapping[str, Mapping[str, str]]
+) -> list[dict[str, object]]:
+    """Explain each ebook file with no signed URL (names only, never URLs).
+
+    Returns:
+        One ``{"key", "file", "available"}`` entry per unmatched file, where
+        ``available`` lists the filenames Humble returned for that key.
+    """
+    missing: list[dict[str, object]] = []
+    for sub in order.subproducts:
+        for download in sub.downloads:
+            if download.platform != EBOOK_PLATFORM:
+                continue
+            returned = signed.get(download.key or "", {})
+            for file in download.files:
+                if file.url not in returned:
+                    missing.append(
+                        {"key": download.key, "file": file.url, "available": sorted(returned)}
+                    )
+    return missing
 
 
 def is_auth_host(url: str) -> bool:
@@ -241,9 +266,17 @@ class LibraryClient:
         signed: dict[str, dict[str, str]] = {}
         for batch in batched(ids, SIGNED_URL_BATCH):
             signed.update(await self._signed_batch(page_url, batch))
+        details = describe_missing(order, signed)
         order, missing = apply_signed_urls(order, signed)
         if missing:
-            _log.warning("signed_urls_missing", extra={"count": len(missing)})
+            _log.warning(
+                "signed_urls_missing",
+                extra={
+                    "bundle": bundle_id,
+                    "count": len(missing),
+                    "files": details[:MISSING_LOG_LIMIT],
+                },
+            )
         return order, missing
 
     async def refresh(self, bundle_id: str) -> Order:

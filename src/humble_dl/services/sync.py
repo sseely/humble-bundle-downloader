@@ -24,7 +24,6 @@ from humble_dl.workers.downloader import Result, execute
 
 EVENT_STARTED = "sync_started"
 EVENT_COMPLETE = "sync_complete"
-EVENT_MISSING_URLS = "signed_urls_missing"
 EVENT_BUNDLE_FAILED = "bundle_failed"
 STATUS_DOWNLOADED = "downloaded"
 STATUS_ARCHIVED = "archived_and_downloaded"
@@ -84,7 +83,8 @@ class Summary:
     ones); ``archived`` counts the subset whose old version was archived. For a
     dry run only ``planned``, ``skipped``, ``actions`` and ``failed_bundles``
     are populated. ``failed_bundles`` lists titles of bundles that could not be
-    loaded (their files were not planned).
+    loaded (their files were not planned); ``unsigned_files`` lists
+    ``<bundle title>/<filename>`` for files Humble returned no signed URL for.
     """
 
     planned: int
@@ -97,6 +97,7 @@ class Summary:
     failures: list[Path]
     actions: list[Action] = field(default_factory=lambda: list[Action]())
     failed_bundles: list[str] = field(default_factory=lambda: list[str]())
+    unsigned_files: list[str] = field(default_factory=lambda: list[str]())
 
 
 def filter_bundles(bundles: Iterable[BundleRef], only: str | None) -> list[BundleRef]:
@@ -180,24 +181,30 @@ def _dry_summary(actions: list[Action], duration_s: float) -> Summary:
     return Summary(len(actions), skipped, 0, 0, 0, 0, duration_s, [], actions)
 
 
-async def _load_orders(deps: SyncDeps, opts: SyncOptions) -> tuple[list[Order], list[str]]:
+@dataclass(frozen=True)
+class _Loaded:
+    orders: list[Order]
+    failed_bundles: list[str]
+    unsigned_files: list[str]
+
+
+async def _load_orders(deps: SyncDeps, opts: SyncOptions) -> _Loaded:
     """Load each bundle; a bundle whose request fails is skipped, not fatal.
 
-    Session, bot-challenge and schema-drift errors still abort the run.
+    Session, bot-challenge and schema-drift errors still abort the run. The
+    client already logs files without a signed URL; they are collected here.
     """
-    orders: list[Order] = []
-    failed: list[str] = []
+    loaded = _Loaded([], [], [])
     for bundle in filter_bundles(await deps.library.list_bundles(), opts.only):
         try:
             order, missing = await deps.library.get_order(bundle.id)
         except LibraryApiError as exc:
             _log.error(EVENT_BUNDLE_FAILED, extra={"bundle": bundle.title, "error": str(exc)})
-            failed.append(bundle.title)
+            loaded.failed_bundles.append(bundle.title)
             continue
-        if missing:
-            _log.warning(EVENT_MISSING_URLS, extra={"count": len(missing)})
-        orders.append(order)
-    return orders, failed
+        loaded.unsigned_files.extend(f"{bundle.title}/{name}" for name in missing)
+        loaded.orders.append(order)
+    return loaded
 
 
 def make_refresh(
@@ -246,6 +253,7 @@ def _log_complete(summary: Summary) -> None:
             "bytes": summary.bytes,
             "duration_s": summary.duration_s,
             "failed_bundles": len(summary.failed_bundles),
+            "unsigned_files": len(summary.unsigned_files),
         },
     )
 
@@ -269,8 +277,8 @@ async def run_sync(settings: Settings, opts: SyncOptions, deps: SyncDeps) -> Sum
         EVENT_STARTED,
         extra={"output_dir": str(settings.output_dir), "dry_run": opts.dry_run, "only": opts.only},
     )
-    orders, failed_bundles = await _load_orders(deps, opts)
-    plan_ = plan(orders, settings.output_dir, deps.cache.local_file)
+    loaded = await _load_orders(deps, opts)
+    plan_ = plan(loaded.orders, settings.output_dir, deps.cache.local_file)
     _check_space(plan_.bytes_to_fetch, settings.output_dir, deps.free_bytes)
     if opts.dry_run:
         summary = _dry_summary(plan_.actions, deps.clock() - started)
@@ -279,6 +287,8 @@ async def run_sync(settings: Settings, opts: SyncOptions, deps: SyncDeps) -> Sum
         results = await execute(plan_.actions, deps.http, refresh, settings, sleep=deps.sleep)
         _record_hashes(deps.cache, results)
         summary = summarize(plan_.actions, results, deps.clock() - started)
-    summary = replace(summary, failed_bundles=failed_bundles)
+    summary = replace(
+        summary, failed_bundles=loaded.failed_bundles, unsigned_files=loaded.unsigned_files
+    )
     _log_complete(summary)
     return summary

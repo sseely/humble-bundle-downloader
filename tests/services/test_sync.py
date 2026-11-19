@@ -321,7 +321,7 @@ def test_summarize_counts_each_status() -> None:
     )
 
 
-async def test_missing_signed_urls_are_logged(
+async def test_missing_signed_urls_are_reported(
     settings: Settings, cache: HashCache, httpx_mock: HTTPXMock, capsys: pytest.CaptureFixture[str]
 ) -> None:
     class Missing(FakeLibrary):
@@ -332,8 +332,10 @@ async def test_missing_signed_urls_are_logged(
     httpx_mock.add_response(url=ALPHA.url, content=ALPHA.body)
     library = Missing({"k1": make_order("k1", "Python Bundle", [ALPHA], "alpha")})
     async with httpx.AsyncClient() as client:
-        await run_sync(settings, SyncOptions(False, None), deps(library, client, cache))
-    assert '"msg": "signed_urls_missing"' in capsys.readouterr().err
+        summary = await run_sync(settings, SyncOptions(False, None), deps(library, client, cache))
+    # Files with no signed URL are reported, never silently dropped.
+    assert summary.unsigned_files == ["Python Bundle/lost.epub"]
+    assert '"unsigned_files": 1' in capsys.readouterr().err
 
 
 @dataclass

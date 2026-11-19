@@ -21,11 +21,19 @@ from humble_dl.api.client import (
     backoff_delay,
     batched,
     classify_action,
+    describe_missing,
     find_action_id,
 )
 from humble_dl.auth.session import BotChallengeError, SessionExpiredError
 from humble_dl.config import Settings, load_settings
-from humble_dl.models.library import FileVersion, Order, SchemaDriftError, Subproduct, ebook_items
+from humble_dl.models.library import (
+    Download,
+    FileVersion,
+    Order,
+    SchemaDriftError,
+    Subproduct,
+    ebook_items,
+)
 
 FIXTURES = Path(__file__).parent.parent / "helpers" / "fixtures" / "library"
 BUNDLE_ID = "00000000-0000-4000-8000-000000000054"
@@ -375,3 +383,22 @@ def test_classify_action(status: int, body: str, verdict: ActionVerdict) -> None
 
 def test_backoff_delay() -> None:
     assert [backoff_delay(n) for n in (1, 2, 3, 4)] == [1.0, 2.0, 4.0, 8.0]
+
+
+def test_describe_missing_names_keys_and_available_files() -> None:
+    files = [
+        FileVersion(label="EPUB", url="a.epub", md5=None, file_size=None),
+        FileVersion(label="PDF", url="a.pdf", md5=None, file_size=None),
+    ]
+    sub = Subproduct(
+        machine_name="a",
+        human_name="A",
+        downloads=[Download(platform="ebook", key="a_ebook", files=files)],
+        entitlement_id="e1",
+    )
+    order = Order(gamekey="b", human_name="B", subproducts=[sub])
+    signed = {"a_ebook": {"a.epub": "https://x/a.epub", "a_v2.pdf": "https://x/a_v2.pdf"}}
+
+    assert describe_missing(order, signed) == [
+        {"key": "a_ebook", "file": "a.pdf", "available": ["a.epub", "a_v2.pdf"]}
+    ]

@@ -82,6 +82,7 @@ MSG_DRY_LINE = "{verb} {relative} ({size})"
 MSG_DRY_TOTAL = "Dry run: {count} files to fetch, {bytes} known bytes."
 MSG_FAILED_FILES = "{count} file(s) failed:"
 MSG_FAILED_BUNDLES = "{count} bundle(s) could not be loaded:"
+MSG_UNSIGNED_FILES = "{count} file(s) had no download link:"
 UNKNOWN_SIZE = "size unknown"
 VERB_FETCH = "fetch"
 VERB_REPLACE = "archive+fetch"
@@ -260,6 +261,10 @@ def _failure_sections(summary: Summary) -> list[str]:
         listing = "\n".join(f"  {title}" for title in summary.failed_bundles)
         count = len(summary.failed_bundles)
         sections.append(f"{MSG_FAILED_BUNDLES.format(count=count)}\n{listing}")
+    if summary.unsigned_files:
+        listing = "\n".join(f"  {name}" for name in summary.unsigned_files)
+        count = len(summary.unsigned_files)
+        sections.append(f"{MSG_UNSIGNED_FILES.format(count=count)}\n{listing}")
     return sections
 
 
