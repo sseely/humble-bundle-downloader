@@ -135,7 +135,8 @@ async def _login(
 async def _capture(
     settings: Settings, out: Path, opener: ContextOpener, capture_fn: CaptureFn
 ) -> None:
-    async with opener(settings, headed=False) as ctx:
+    # Headed: Cloudflare blocks server-action POSTs (signed URLs) from headless Chromium.
+    async with opener(settings, headed=True) as ctx:
         written = await capture_fn(ctx, settings, out)
     typer.echo(MSG_CAPTURE_DONE.format(count=len(written), out_dir=out), err=True)
     typer.echo(MSG_REVIEW, err=True)

@@ -162,7 +162,7 @@ def test_capture_never_persists(monkeypatch: pytest.MonkeyPatch) -> None:
     assert rec.persist_ctx == []
 
 
-def test_capture_success_reports_and_uses_headless(
+def test_capture_success_reports_and_uses_headed_browser(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     rec = Recorder(written=3)
@@ -170,7 +170,8 @@ def test_capture_success_reports_and_uses_headless(
     out = tmp_path / "fixtures"
     result = invoke("capture", "--out", str(out))
     assert result.exit_code == cli.EXIT_OK
-    assert rec.headed == [False]
+    # Cloudflare blocks server-action POSTs from headless Chromium (signed URLs).
+    assert rec.headed == [True]
     assert rec.capture_out == [out]
     assert f"Wrote 3 files to {out}." in result.stderr
     assert "Review the captured files" in result.stderr
