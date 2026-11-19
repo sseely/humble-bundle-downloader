@@ -1,7 +1,8 @@
 """Tests for the CLI shell: exit codes, messages, injection seams."""
 
 import json
-from collections.abc import AsyncGenerator
+import sys
+from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import cast
@@ -22,6 +23,8 @@ from humble_dl.auth.session import (
 )
 from humble_dl.config import ConfigError, Settings
 from humble_dl.models.library import SchemaDriftError
+from humble_dl.services import books as books_service
+from humble_dl.services.books import BooksDeps
 from humble_dl.services.planner import ArchiveThenFetch, Fetch, FileKey, Skip
 from humble_dl.services.sync import (
     InsufficientSpaceError,
@@ -404,3 +407,137 @@ async def test_make_library_builds_client_on_new_page(tmp_path: Path) -> None:
     library = await cli._make_library(cast("cli.BrowserLike", ctx), settings)  # pyright: ignore[reportPrivateUsage]
     assert ctx.pages == 1
     assert type(library).__name__ == "LibraryClient"
+
+
+class BooksRecorder:
+    """Fake Books runner; records argv lists and never launches anything."""
+
+    def __init__(self, fail_on: frozenset[int] = frozenset()) -> None:
+        self.calls: list[list[str]] = []
+        self.sleeps: list[float] = []
+        self.fail_on = fail_on
+
+    def __call__(self, argv: Sequence[str]) -> bool:
+        self.calls.append(list(argv))
+        return len(self.calls) not in self.fail_on
+
+    def deps(self, platform: str = "darwin") -> BooksDeps:
+        return BooksDeps(runner=self, sleep=self.sleeps.append, platform=platform)
+
+
+def install_books(
+    monkeypatch: pytest.MonkeyPatch, rec: BooksRecorder, platform: str = "darwin"
+) -> None:
+    monkeypatch.setattr(cli, "BOOKS_DEPS", lambda: rec.deps(platform))
+
+
+def seed_books(out: Path, count: int) -> list[Path]:
+    paths = [out / "Bundle" / f"Item{n}" / f"book{n}.epub" for n in range(count)]
+    for path in paths:
+        path.parent.mkdir(parents=True)
+        path.write_text("x")
+    return paths
+
+
+def test_books_imports_then_skips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rec = BooksRecorder()
+    install_books(monkeypatch, rec)
+    out = tmp_path / "lib"
+    seed_books(out, 3)
+    first = invoke("books", "--output", str(out), "--batch", "2", "--pause", "1")
+    assert first.exit_code == cli.EXIT_OK
+    assert "selected 3, already imported 0, imported 3, changed 0, failed 0" in first.stdout
+    assert len(rec.calls) == 2
+    assert rec.sleeps == [1.0]
+    second = invoke("books", "--output", str(out))
+    assert second.exit_code == cli.EXIT_OK
+    assert "selected 3, already imported 3, imported 0, changed 0, failed 0" in second.stdout
+    assert len(rec.calls) == 2
+
+
+def test_books_failed_batch_exits_4_and_lists_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rec = BooksRecorder(fail_on=frozenset({2}))
+    install_books(monkeypatch, rec)
+    out = tmp_path / "lib"
+    files = [p.resolve() for p in seed_books(out, 3)]
+    result = invoke("books", "--output", str(out), "--batch", "1", "--pause", "0")
+    assert result.exit_code == cli.EXIT_FILES
+    assert "1 file(s) failed to import into Books:" in result.stderr
+    assert str(files[1]) in result.stderr
+    assert str(files[0]) not in result.stderr
+    assert "failed 1" in result.stdout
+
+
+def test_books_corrupt_state_exits_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, isolated_home: Path
+) -> None:
+    rec = BooksRecorder()
+    install_books(monkeypatch, rec)
+    out = tmp_path / "lib"
+    seed_books(out, 1)
+    state = isolated_home / ".humble-dl" / "books-imported.json"
+    state.parent.mkdir()
+    state.write_text("garbage")
+    result = invoke("books", "--output", str(out))
+    assert result.exit_code == cli.EXIT_CONFIG
+    assert "corrupt" in result.stderr
+    assert rec.calls == []
+
+
+def test_books_non_darwin_exits_1(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rec = BooksRecorder()
+    install_books(monkeypatch, rec, platform="linux")
+    out = tmp_path / "lib"
+    seed_books(out, 1)
+    result = invoke("books", "--output", str(out))
+    assert result.exit_code == cli.EXIT_CONFIG
+    assert "Apple Books import requires macOS." in result.stderr
+    assert rec.calls == []
+
+
+def test_books_dry_run_on_non_darwin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, isolated_home: Path
+) -> None:
+    rec = BooksRecorder()
+    install_books(monkeypatch, rec, platform="linux")
+    out = tmp_path / "lib"
+    seed_books(out, 2)
+    result = invoke("books", "--output", str(out), "--dry-run")
+    assert result.exit_code == cli.EXIT_OK
+    assert result.stdout.splitlines() == [
+        "import Bundle/Item0/book0.epub",
+        "import Bundle/Item1/book1.epub",
+        "Dry run: 2 files to import.",
+    ]
+    assert rec.calls == []
+    assert not (isolated_home / ".humble-dl").exists()
+
+
+@pytest.mark.parametrize("args", [["--batch", "0"], ["--batch", "51"], ["--pause", "-1"]])
+def test_books_invalid_options_exit_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, args: list[str]
+) -> None:
+    rec = BooksRecorder()
+    install_books(monkeypatch, rec)
+    result = invoke("books", "--output", str(tmp_path), *args)
+    assert result.exit_code == cli.EXIT_CONFIG
+    assert rec.calls == []
+
+
+def test_books_only_filter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rec = BooksRecorder()
+    install_books(monkeypatch, rec)
+    out = tmp_path / "lib"
+    seed_books(out, 1)
+    result = invoke("books", "--output", str(out), "--only", "nomatch")
+    assert result.exit_code == cli.EXIT_OK
+    assert "selected 0" in result.stdout
+    assert rec.calls == []
+
+
+def test_books_default_deps_are_real() -> None:
+    deps = cli.BOOKS_DEPS()
+    assert deps.runner is books_service.run_open
+    assert deps.platform == sys.platform

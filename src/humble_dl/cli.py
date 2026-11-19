@@ -39,6 +39,16 @@ from humble_dl.config import ConfigError, Settings, load_settings
 from humble_dl.lib.hashcache import HashCache
 from humble_dl.lib.logging import get_logger
 from humble_dl.models.library import SchemaDriftError
+from humble_dl.services.books import (
+    DEFAULT_BATCH,
+    DEFAULT_PAUSE_S,
+    BooksDeps,
+    BooksError,
+    BooksFailedError,
+    BooksOptions,
+    BooksReport,
+    import_books,
+)
 from humble_dl.services.planner import ArchiveThenFetch
 from humble_dl.services.sync import (
     InsufficientSpaceError,
@@ -83,6 +93,11 @@ MSG_DRY_TOTAL = "Dry run: {count} files to fetch, {bytes} known bytes."
 MSG_FAILED_FILES = "{count} file(s) failed:"
 MSG_FAILED_BUNDLES = "{count} bundle(s) could not be loaded:"
 MSG_UNSIGNED_FILES = "{count} file(s) had no download link:"
+MSG_BOOKS_SUMMARY = (
+    "selected {selected}, already imported {already}, imported {imported}, "
+    "changed {changed}, failed {failed}"
+)
+MSG_BOOKS_FAILED = "{count} file(s) failed to import into Books:"
 UNKNOWN_SIZE = "size unknown"
 VERB_FETCH = "fetch"
 VERB_REPLACE = "archive+fetch"
@@ -129,6 +144,7 @@ PERSIST_COOKIES: PersistFn = persist_session_cookies
 RUN_SYNC: SyncFn = run_sync
 ASSERT_LOGGED_IN: AssertLoggedInFn = assert_logged_in
 MAKE_LIBRARY: LibraryFactory = _make_library
+BOOKS_DEPS: Callable[[], BooksDeps] = BooksDeps
 
 # Most specific first: BotChallengeError subclasses SessionExpiredError.
 # A ``None`` message means "use the exception's own message".
@@ -137,6 +153,8 @@ _ERROR_MAP: tuple[tuple[type[Exception], int, str | None], ...] = (
     (SessionExpiredError, EXIT_SESSION, MSG_SESSION_EXPIRED),
     (SchemaDriftError, EXIT_SCHEMA, MSG_SCHEMA_DRIFT),
     (SyncFailedError, EXIT_FILES, None),
+    (BooksFailedError, EXIT_FILES, None),
+    (BooksError, EXIT_CONFIG, None),
     (InsufficientSpaceError, EXIT_CONFIG, None),
     (LibraryApiError, EXIT_CONFIG, None),
     (PlaywrightError, EXIT_CONFIG, MSG_BROWSER_ERROR),
@@ -306,3 +324,49 @@ def sync(
         _report_sync(summary, settings, opts)
 
     _run("sync", body)
+
+
+def _report_books(report: BooksReport, dry_run: bool) -> None:
+    for line in report.lines:
+        typer.echo(line)
+    if not dry_run:
+        typer.echo(
+            MSG_BOOKS_SUMMARY.format(
+                selected=report.selected,
+                already=report.already,
+                imported=report.imported,
+                changed=report.changed,
+                failed=len(report.failed),
+            )
+        )
+    if report.failed:
+        listing = "\n".join(f"  {path}" for path in report.failed)
+        raise BooksFailedError(f"{MSG_BOOKS_FAILED.format(count=len(report.failed))}\n{listing}")
+
+
+@app.command()
+def books(
+    output: Annotated[
+        Path | None, typer.Option("--output", help="Output directory (default ~/HumbleBundle).")
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="List what would be imported; change nothing.")
+    ] = False,
+    only: Annotated[
+        str | None, typer.Option("--only", help="Only bundles whose folder name contains TEXT.")
+    ] = None,
+    batch: Annotated[
+        int, typer.Option("--batch", help="Files per Books launch (1-50).")
+    ] = DEFAULT_BATCH,
+    pause: Annotated[
+        float, typer.Option("--pause", help="Seconds between batches (0-60).")
+    ] = DEFAULT_PAUSE_S,
+) -> None:
+    """Import one file per downloaded ebook into Apple Books (macOS)."""
+
+    def body() -> None:
+        settings = load_settings(os.environ, Path.home(), output_override=output)
+        opts = BooksOptions(dry_run=dry_run, only=only, batch=batch, pause=pause)
+        _report_books(import_books(settings, opts, BOOKS_DEPS()), dry_run)
+
+    _run("books", body)
