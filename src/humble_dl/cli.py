@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Annotated, Protocol
 
 import typer
+from playwright.async_api import Cookie
 
 from humble_dl.api.capture import (
     CaptureContext,
@@ -21,11 +22,13 @@ from humble_dl.api.capture import (
 )
 from humble_dl.auth.session import (
     BotChallengeError,
+    CookieJar,
     SessionCheckError,
     SessionContext,
     SessionExpiredError,
     interactive_login,
     open_context,
+    persist_session_cookies,
 )
 from humble_dl.config import ConfigError, Settings, load_settings
 from humble_dl.lib.logging import get_logger
@@ -53,14 +56,21 @@ MSG_REVIEW = "Review the captured files before committing them."
 _log = get_logger(__name__)
 
 
+class BrowserLike(CaptureContext, CookieJar, Protocol):
+    """A context usable by both commands (a real ``BrowserContext`` satisfies it)."""
+
+    async def cookies(self) -> list[Cookie]: ...  # pyright: ignore[reportIncompatibleMethodOverride]
+
+
 class ContextOpener(Protocol):
     """Opens a browser context on the persistent profile."""
 
     def __call__(
         self, settings: Settings, *, headed: bool
-    ) -> AbstractAsyncContextManager[CaptureContext]: ...
+    ) -> AbstractAsyncContextManager[BrowserLike]: ...
 
 
+PersistFn = Callable[[CookieJar, Settings], Awaitable[int]]
 LoginFn = Callable[[SessionContext, Settings], Awaitable[None]]
 CaptureFn = Callable[[CaptureContext, Settings, Path], Awaitable[list[Path]]]
 
@@ -68,6 +78,7 @@ CaptureFn = Callable[[CaptureContext, Settings, Path], Awaitable[list[Path]]]
 OPEN_CONTEXT: ContextOpener = open_context
 INTERACTIVE_LOGIN: LoginFn = interactive_login
 RUN_CAPTURE: CaptureFn = run_capture
+PERSIST_COOKIES: PersistFn = persist_session_cookies
 
 # Most specific first: BotChallengeError subclasses SessionExpiredError.
 # A ``None`` message means "use the exception's own message".
@@ -112,9 +123,12 @@ def _run(command: str, body: Callable[[], None]) -> None:
     raise typer.Exit(code)
 
 
-async def _login(settings: Settings, opener: ContextOpener, login_fn: LoginFn) -> None:
+async def _login(
+    settings: Settings, opener: ContextOpener, login_fn: LoginFn, persist_fn: PersistFn
+) -> None:
     async with opener(settings, headed=True) as ctx:
         await login_fn(ctx, settings)
+        await persist_fn(ctx, settings)
     typer.echo(MSG_LOGIN_DONE, err=True)
 
 
@@ -129,7 +143,7 @@ async def _capture(
 
 def _login_body() -> None:
     settings = load_settings(os.environ, Path.home())
-    asyncio.run(_login(settings, OPEN_CONTEXT, INTERACTIVE_LOGIN))
+    asyncio.run(_login(settings, OPEN_CONTEXT, INTERACTIVE_LOGIN, PERSIST_COOKIES))
 
 
 @app.command()

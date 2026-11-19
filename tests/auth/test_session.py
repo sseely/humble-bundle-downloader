@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from playwright.async_api import BrowserContext
+from playwright._impl._api_structures import SetCookieParam
+from playwright.async_api import BrowserContext, Cookie
 from playwright.async_api import Error as PlaywrightError
 
 from humble_dl.auth import session
@@ -17,15 +18,19 @@ from humble_dl.auth.session import (
     HUMBLE_BASE,
     SESSION_PROBE_URL,
     BotChallengeError,
+    CookieJar,
     ProbeVerdict,
     SessionCheckError,
     SessionContext,
     SessionExpiredError,
     assert_logged_in,
     classify_probe,
+    cookies_to_persist,
     fetch_identity_secrets,
     interactive_login,
     open_context,
+    parse_session_expiry,
+    persist_session_cookies,
     prepare_profile_dir,
 )
 from humble_dl.config import Settings
@@ -437,3 +442,181 @@ async def test_open_context_prepares_profile_launches_and_closes(
 async def test_live_open_context_headless(tmp_path: Path) -> None:
     async with open_context(make_settings(tmp_path), headed=False) as ctx:
         assert ctx.pages is not None
+
+
+EXPIRES_ISO = "2026-11-19T18:44:57.699884632Z"
+EXPIRES_POSIX = 1795113897.699884
+NOW = 1_000_000.0
+FALLBACK_S = 86400
+SECRET_VALUE = "SECRET-COOKIE-VALUE-xyz"  # noqa: S105
+SESSION_NAME = "_kratos_session"
+
+
+def real_context_as_jar(real: BrowserContext) -> CookieJar:
+    return real  # static check: pyright fails if BrowserContext is not structural match
+
+
+def make_cookie(
+    name: str = SESSION_NAME,
+    domain: str = ".humblebundle.com",
+    expires: float = -1,
+    value: str = SECRET_VALUE,
+) -> Cookie:
+    return Cookie(
+        name=name,
+        value=value,
+        domain=domain,
+        path="/",
+        expires=expires,
+        httpOnly=True,
+        secure=True,
+        sameSite="Lax",
+    )
+
+
+class FakeJarContext(FakeContext):
+    def __init__(
+        self,
+        responses: list[FakeResponse | Exception],
+        cookies: list[Cookie] | None = None,
+        cookie_error: Exception | None = None,
+    ) -> None:
+        super().__init__(responses)
+        self.stored = cookies or []
+        self.cookie_error = cookie_error
+        self.added: list[list[SetCookieParam]] = []
+
+    async def cookies(self) -> list[Cookie]:
+        if self.cookie_error:
+            raise self.cookie_error
+        return self.stored
+
+    async def add_cookies(self, cookies: Any) -> None:
+        self.added.append(list(cookies))
+
+
+def as_jar(ctx: FakeJarContext) -> CookieJar:
+    return ctx
+
+
+def test_parse_session_expiry_handles_nine_digit_fraction_and_z() -> None:
+    assert parse_session_expiry({"expires_at": EXPIRES_ISO}) == pytest.approx(EXPIRES_POSIX)
+
+
+def test_parse_session_expiry_treats_naive_as_utc() -> None:
+    assert parse_session_expiry({"expires_at": "1970-01-02T00:00:00"}) == 86400.0
+
+
+@pytest.mark.parametrize(
+    "body", [{}, {"expires_at": "garbage"}, {"expires_at": 5}, [], "x", None, {"id": "x"}]
+)
+def test_parse_session_expiry_none_for_missing_or_garbage(body: object) -> None:
+    assert parse_session_expiry(body) is None
+
+
+def test_cookies_to_persist_keeps_attributes_and_sets_expiry() -> None:
+    result = cookies_to_persist([make_cookie()], 123.0)
+    assert result == [
+        {
+            "name": SESSION_NAME,
+            "value": SECRET_VALUE,
+            "domain": ".humblebundle.com",
+            "path": "/",
+            "expires": 123.0,
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "Lax",
+        }
+    ]
+
+
+def test_cookies_to_persist_omits_absent_optional_attributes() -> None:
+    bare = Cookie(name="a", value="b", domain="www.humblebundle.com", path="/p", expires=0)
+    assert cookies_to_persist([bare], 5.0) == [
+        {"name": "a", "value": "b", "domain": "www.humblebundle.com", "path": "/p", "expires": 5.0}
+    ]
+
+
+def test_cookies_to_persist_filters_by_domain_and_expiry() -> None:
+    cookies = [
+        make_cookie("keep1", ".auth.humblebundle.com"),
+        make_cookie("keep2", "www.humblebundle.com"),
+        make_cookie("keep3", "humblebundle.com", expires=0),
+        make_cookie("persistent", ".humblebundle.com", expires=999.0),
+        make_cookie("other", ".example.com"),
+        make_cookie("lookalike", ".nothumblebundle.com"),
+    ]
+    assert [c.get("name") for c in cookies_to_persist(cookies, 1.0)] == ["keep1", "keep2", "keep3"]
+
+
+async def test_persist_adds_only_session_cookies_with_parsed_expiry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cookies = [
+        make_cookie("s1"),
+        make_cookie("cf", expires=NOW + 5),
+        make_cookie("s2", ".auth.humblebundle.com"),
+        make_cookie("x", ".example.com"),
+    ]
+    expiry = NOW + 1000
+    body = {"expires_at": "1970-01-12T14:03:20Z"}  # NOW + 1000 s
+    ctx = FakeJarContext([FakeResponse(200, json_body=body)], cookies)
+    count = await persist_session_cookies(as_jar(ctx), make_settings(tmp_path), now=lambda: NOW)
+    assert count == 2
+    assert len(ctx.added) == 1
+    assert [(p.get("name"), p.get("expires")) for p in ctx.added[0]] == [
+        ("s1", expiry),
+        ("s2", expiry),
+    ]
+    assert ctx.request.calls == [(SESSION_PROBE_URL, API_TIMEOUT_S * 1000, 0)]
+    err = capsys.readouterr().err
+    assert '"msg": "session_cookies_persisted"' in err
+    assert '"count": 2' in err
+    assert '"names": ["s1", "s2"]' in err
+    assert SECRET_VALUE not in err
+    assert "session_expiry_unknown" not in err
+
+
+@pytest.mark.parametrize("body", [{}, {"expires_at": "1970-01-01T00:00:01Z"}])
+async def test_persist_falls_back_when_expiry_unknown_or_past(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], body: object
+) -> None:
+    ctx = FakeJarContext([FakeResponse(200, json_body=body)], [make_cookie()])
+    count = await persist_session_cookies(as_jar(ctx), make_settings(tmp_path), now=lambda: NOW)
+    assert count == 1
+    assert ctx.added[0][0].get("expires") == NOW + FALLBACK_S
+    err = capsys.readouterr().err
+    assert '"msg": "session_expiry_unknown"' in err
+    assert SECRET_VALUE not in err
+
+
+async def test_persist_warns_when_no_session_cookie_found(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ctx = FakeJarContext([FakeResponse(200, json_body={"expires_at": EXPIRES_ISO})], [])
+    assert await persist_session_cookies(as_jar(ctx), make_settings(tmp_path)) == 0
+    assert ctx.added == [[]]
+    assert '"msg": "session_cookie_not_found"' in capsys.readouterr().err
+
+
+async def test_persist_401_raises_expired_without_touching_cookies(tmp_path: Path) -> None:
+    ctx = FakeJarContext([FakeResponse(401)], [make_cookie()])
+    with pytest.raises(SessionExpiredError):
+        await persist_session_cookies(as_jar(ctx), make_settings(tmp_path))
+    assert ctx.added == []
+
+
+async def test_persist_wraps_request_error(tmp_path: Path) -> None:
+    original = PlaywrightError("net")
+    ctx = FakeJarContext([original])
+    with pytest.raises(SessionCheckError) as info:
+        await persist_session_cookies(as_jar(ctx), make_settings(tmp_path))
+    assert info.value.__cause__ is original
+
+
+async def test_persist_wraps_cookie_error(tmp_path: Path) -> None:
+    original = PlaywrightError("closed")
+    ctx = FakeJarContext([FakeResponse(200, json_body={})], cookie_error=original)
+    with pytest.raises(SessionCheckError) as info:
+        await persist_session_cookies(as_jar(ctx), make_settings(tmp_path))
+    assert info.value.__cause__ is original

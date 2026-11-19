@@ -13,6 +13,7 @@ from humble_dl import cli
 from humble_dl.api.capture import CaptureContext, CaptureError, CaptureLeakError
 from humble_dl.auth.session import (
     BotChallengeError,
+    CookieJar,
     SessionCheckError,
     SessionContext,
     SessionExpiredError,
@@ -21,7 +22,7 @@ from humble_dl.config import ConfigError, Settings
 
 ENV_CONCURRENCY = "HUMBLE_DL_CONCURRENCY"
 ENV_PROFILE = "HUMBLE_DL_PROFILE_DIR"
-FAKE_CTX = cast("CaptureContext", object())
+FAKE_CTX = cast("cli.BrowserLike", object())
 SECRET_URL = "https://www.humblebundle.com/api/v1/order/abc?gamekey=SECRETKEY"  # noqa: S105
 
 
@@ -34,16 +35,31 @@ class Recorder:
         self.headed: list[bool] = []
         self.login_ctx: list[object] = []
         self.capture_out: list[Path] = []
+        self.events: list[str] = []
+        self.persist_ctx: list[object] = []
+        self.persist_error: Exception | None = None
 
     @asynccontextmanager
-    async def opener(self, settings: Settings, *, headed: bool) -> AsyncGenerator[CaptureContext]:
+    async def opener(self, settings: Settings, *, headed: bool) -> AsyncGenerator[cli.BrowserLike]:
         self.headed.append(headed)
-        yield FAKE_CTX
+        self.events.append("open")
+        try:
+            yield FAKE_CTX
+        finally:
+            self.events.append("close")
 
     async def login_fn(self, ctx: SessionContext, settings: Settings) -> None:
         self.login_ctx.append(ctx)
+        self.events.append("login")
         if self.error:
             raise self.error
+
+    async def persist_fn(self, ctx: CookieJar, settings: Settings) -> int:
+        self.persist_ctx.append(ctx)
+        self.events.append("persist")
+        if self.persist_error:
+            raise self.persist_error
+        return 1
 
     async def capture_fn(self, ctx: CaptureContext, settings: Settings, out: Path) -> list[Path]:
         self.capture_out.append(out)
@@ -66,6 +82,7 @@ def install(monkeypatch: pytest.MonkeyPatch, rec: Recorder) -> None:
     monkeypatch.setattr(cli, "OPEN_CONTEXT", rec.opener)
     monkeypatch.setattr(cli, "INTERACTIVE_LOGIN", rec.login_fn)
     monkeypatch.setattr(cli, "RUN_CAPTURE", rec.capture_fn)
+    monkeypatch.setattr(cli, "PERSIST_COOKIES", rec.persist_fn)
 
 
 def invoke(*args: str) -> Result:
@@ -108,6 +125,41 @@ def test_login_success_uses_headed_context(monkeypatch: pytest.MonkeyPatch) -> N
     assert rec.headed == [True]
     assert rec.login_ctx == [FAKE_CTX]
     assert cli.MSG_LOGIN_DONE in result.stderr
+
+
+def test_login_persists_cookies_after_login_before_context_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = Recorder()
+    install(monkeypatch, rec)
+    result = invoke("login")
+    assert result.exit_code == cli.EXIT_OK
+    assert rec.events == ["open", "login", "persist", "close"]
+    assert rec.persist_ctx == [FAKE_CTX]
+
+
+def test_login_persist_session_expired_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder()
+    rec.persist_error = SessionExpiredError("x")
+    install(monkeypatch, rec)
+    result = invoke("login")
+    assert result.exit_code == cli.EXIT_SESSION
+    assert cli.MSG_SESSION_EXPIRED in result.stderr
+    assert cli.MSG_LOGIN_DONE not in result.stderr
+
+
+def test_failed_login_does_not_persist(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(error=SessionExpiredError("x"))
+    install(monkeypatch, rec)
+    invoke("login")
+    assert rec.persist_ctx == []
+
+
+def test_capture_never_persists(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder()
+    install(monkeypatch, rec)
+    invoke("capture")
+    assert rec.persist_ctx == []
 
 
 def test_capture_success_reports_and_uses_headless(

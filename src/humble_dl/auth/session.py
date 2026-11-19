@@ -3,14 +3,16 @@
 import asyncio
 import sys
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
-from playwright.async_api import BrowserContext, async_playwright
+from playwright._impl._api_structures import SetCookieParam
+from playwright.async_api import BrowserContext, Cookie, async_playwright
 from playwright.async_api import Error as PlaywrightError
 
 from humble_dl.config import Settings
@@ -31,6 +33,10 @@ MS_PER_S = 1000
 DEFAULT_POLL_S = 2.0
 BODY_SNIPPET_CHARS = 4096
 LOCATION_HEADER = "location"
+EXPIRES_AT_KEY = "expires_at"
+HUMBLE_COOKIE_DOMAIN = "humblebundle.com"
+SESSION_COOKIE_EXPIRES = -1.0  # Playwright reports browser-session cookies as -1
+SESSION_COOKIE_FALLBACK_S = 24 * 60 * 60
 
 HTTP_OK = 200
 HTTP_UNAUTHORIZED = 401
@@ -95,6 +101,15 @@ class SessionContext(Protocol):
     @property
     def request(self) -> _RequesterLike: ...
     async def new_page(self) -> _PageLike: ...
+
+
+class CookieJar(Protocol):
+    """The slice of ``BrowserContext`` used to persist session cookies."""
+
+    @property
+    def request(self) -> _RequesterLike: ...
+    async def cookies(self) -> list[Cookie]: ...
+    async def add_cookies(self, cookies: Sequence[SetCookieParam]) -> None: ...
 
 
 Sleep = Callable[[float], Awaitable[None]]
@@ -314,3 +329,114 @@ async def interactive_login(
             _log.warning("login_timed_out")
             raise SessionExpiredError("Login timed out; run `humble-dl login` again")
         await sleep(poll_s)
+
+
+def parse_session_expiry(body: object) -> float | None:
+    """Read the Kratos session's top-level ``expires_at`` as POSIX seconds (pure).
+
+    Returns:
+        Seconds since the epoch, or None when missing or unparseable.
+    """
+    if not isinstance(body, dict):
+        return None
+    raw = cast("dict[str, object]", body).get(EXPIRES_AT_KEY)
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def _is_humble_domain(domain: str) -> bool:
+    bare = domain.lstrip(".")
+    return bare == HUMBLE_COOKIE_DOMAIN or bare.endswith("." + HUMBLE_COOKIE_DOMAIN)
+
+
+def _with_expiry(cookie: Cookie, expires_at: float) -> SetCookieParam:
+    param = SetCookieParam(
+        name=cookie.get("name", ""),
+        value=cookie.get("value", ""),
+        domain=cookie.get("domain", ""),
+        path=cookie.get("path", "/"),
+        expires=expires_at,
+    )
+    if "httpOnly" in cookie:
+        param["httpOnly"] = cookie["httpOnly"]
+    if "secure" in cookie:
+        param["secure"] = cookie["secure"]
+    if "sameSite" in cookie:
+        param["sameSite"] = cookie["sameSite"]
+    return param
+
+
+def cookies_to_persist(cookies: Sequence[Cookie], expires_at: float) -> list[SetCookieParam]:
+    """Re-express expiry-less Humble cookies with an explicit expiry (pure).
+
+    Args:
+        cookies: Cookies as reported by the browser context.
+        expires_at: POSIX seconds to apply as the new expiry.
+
+    Returns:
+        Params for each browser-session cookie on humblebundle.com; cookies that
+        already persist, and non-Humble cookies, are omitted.
+    """
+    return [
+        _with_expiry(cookie, expires_at)
+        for cookie in cookies
+        if _is_humble_domain(cookie.get("domain", ""))
+        and cookie.get("expires", SESSION_COOKIE_EXPIRES) <= 0
+    ]
+
+
+async def _fetch_session_expiry(ctx: CookieJar, settings: Settings) -> float | None:
+    """GET whoami and return its parsed expiry; raises on non-200 or Playwright errors."""
+    try:
+        response = await ctx.request.get(
+            SESSION_PROBE_URL, timeout=settings.api_timeout_s * MS_PER_S, max_redirects=0
+        )
+        if response.status != HTTP_OK:
+            raise SessionExpiredError("Session expired; run `humble-dl login`")
+        return parse_session_expiry(await response.json())
+    except PlaywrightError as exc:
+        raise SessionCheckError("Session persistence failed: browser request error") from exc
+
+
+async def persist_session_cookies(
+    ctx: CookieJar, settings: Settings, *, now: Clock = time.time
+) -> int:
+    """Make Humble's browser-session cookies survive context close.
+
+    Chromium never stores expiry-less cookies in a persistent profile, so each is
+    re-added with the Kratos session's own expiry (24 h fallback if unknown).
+
+    Args:
+        ctx: Browser context (or structural equivalent).
+        settings: Provides ``api_timeout_s``.
+        now: Wall clock in POSIX seconds (injectable).
+
+    Returns:
+        Number of cookies re-added.
+
+    Raises:
+        SessionExpiredError: whoami did not return 200.
+        SessionCheckError: Playwright failure.
+    """
+    expires_at = await _fetch_session_expiry(ctx, settings)
+    current = now()
+    if expires_at is None or expires_at <= current:
+        _log.warning("session_expiry_unknown")
+        expires_at = current + SESSION_COOKIE_FALLBACK_S
+    try:
+        params = cookies_to_persist(await ctx.cookies(), expires_at)
+        await ctx.add_cookies(params)
+    except PlaywrightError as exc:
+        raise SessionCheckError("Session persistence failed: browser cookie error") from exc
+    names = [param.get("name", "") for param in params]
+    if not params:
+        _log.warning("session_cookie_not_found")
+    _log.info("session_cookies_persisted", extra={"count": len(params), "names": names})
+    return len(params)
