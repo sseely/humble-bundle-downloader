@@ -13,12 +13,21 @@ import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Protocol
 from urllib.parse import quote, unquote, urlsplit
 
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from humble_dl.api.capture_page import (
+    BodyLike,
+    CapturePage,
+    PageResponse,
+    ResponseCollector,
+    first_bundle_id,
+    load_library,
+    open_bundle,
+    request_signed_urls,
+)
 from humble_dl.api.rsc import (
     KIND_FLIGHT,
     KIND_JSON,
@@ -28,8 +37,6 @@ from humble_dl.api.rsc import (
     classify_response,
     extract_flight_from_html,
     is_humble_host,
-    library_detail_path,
-    select_bundle_id,
 )
 from humble_dl.api.sanitize import (
     EMAIL_PLACEHOLDER,
@@ -85,8 +92,6 @@ HTTP_GET = "GET"
 MAX_PAGE_RESPONSES = 200
 MAX_BODY_CHARS = 20 * 1024 * 1024
 MAX_ORDERS = 5
-SCROLL_STEPS = 3
-SCROLL_DELTA_PX = 2000
 MIN_COOKIE_CHARS = 8
 
 CONTENT_TYPE_HEADER = "content-type"
@@ -105,8 +110,6 @@ INDEX_HEADER = (
 )
 NO_FILE = "-"
 
-SCRIPT_SELECTOR = "script"
-SCRIPT_TEXT_JS = "els => els.map(e => e.textContent)"
 
 ORDER_PATH_RE = re.compile(rf"^{re.escape(ORDER_PATH_PREFIX)}/([^/]+)")
 SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -119,45 +122,6 @@ IdentityFetcher = Callable[[SessionContext, Settings], Awaitable[list[str]]]
 
 class CaptureError(Exception):
     """Capture could not complete (browser or request failure); nothing was written."""
-
-
-class _BodyLike(Protocol):
-    @property
-    def status(self) -> int: ...
-    @property
-    def headers(self) -> dict[str, str]: ...
-    async def text(self) -> str: ...
-
-
-class _RequestLike(Protocol):
-    @property
-    def method(self) -> str: ...
-
-
-class PageResponse(_BodyLike, Protocol):
-    """The slice of Playwright ``Response`` this module uses."""
-
-    @property
-    def url(self) -> str: ...
-    @property
-    def request(self) -> _RequestLike: ...
-
-
-class _MouseLike(Protocol):
-    async def wheel(self, delta_x: float, delta_y: float) -> None: ...
-
-
-class CapturePage(Protocol):
-    """The slice of Playwright ``Page`` this module uses."""
-
-    @property
-    def mouse(self) -> _MouseLike: ...
-    def on(self, event: Literal["response"], f: Callable[[PageResponse], None]) -> None: ...
-    async def goto(self, url: str, *, timeout: float | None = ...) -> object: ...
-    async def wait_for_load_state(
-        self, state: Literal["networkidle"] | None = ..., *, timeout: float | None = ...
-    ) -> None: ...
-    async def eval_on_selector_all(self, selector: str, expression: str) -> Any: ...
 
 
 class CaptureContext(SessionContext, Protocol):
@@ -314,7 +278,7 @@ def _loggable_path(url: str) -> str:
     return GIFT_PATH_RE.sub(lambda m: f"/gift/{redact_gamekey(m.group(1))}", path)
 
 
-async def _read_text(response: _BodyLike) -> str | None:
+async def _read_text(response: BodyLike) -> str | None:
     try:
         return await response.text()
     except PlaywrightError:
@@ -331,7 +295,7 @@ def _parse_body(base: Record, kind: ResponseKind, text: str) -> Record:
     return replace(base, flight=flight, flight_kind=kind) if flight else base
 
 
-async def _response_record(response: _BodyLike, url: str, method: str) -> Record:
+async def _response_record(response: BodyLike, url: str, method: str) -> Record:
     base = Record(url, method, response.status, False, None)
     kind = classify_response(url, response.headers.get(CONTENT_TYPE_HEADER, ""))
     text = await _read_text(response) if kind else None
@@ -349,61 +313,32 @@ def _log_record(record: Record) -> None:
     )
 
 
-class _ResponseCollector:
-    """Collects humblebundle.com responses from ``page.on("response")``, capped."""
-
-    def __init__(self, limit: int) -> None:
-        self._limit = limit
-        self.responses: list[PageResponse] = []
-
-    def add(self, response: PageResponse) -> None:
-        if len(self.responses) < self._limit and is_humble_host(response.url):
-            self.responses.append(response)
-
-
 async def _page_record(response: PageResponse) -> Record:
     record = await _response_record(response, response.url, response.request.method)
     _log_record(record)
     return record
 
 
-async def _wait_idle(page: CapturePage, timeout_ms: float) -> None:
-    try:
-        await page.wait_for_load_state("networkidle", timeout=timeout_ms)
-    except PlaywrightTimeoutError:
-        _log.warning("capture_network_not_idle")
-
-
-async def _open_detail(page: CapturePage, timeout_ms: float) -> None:
-    """Best-effort: open the first bundle's detail page (a read-only GET) and capture it."""
-    try:
-        raw = cast("list[Any]", await page.eval_on_selector_all(SCRIPT_SELECTOR, SCRIPT_TEXT_JS))
-        bundle_id = select_bundle_id(item for item in raw if isinstance(item, str))
-        if bundle_id is None:
-            _log.info("capture_no_detail_link")
-            return
-        await page.goto(HUMBLE_BASE + library_detail_path(bundle_id), timeout=timeout_ms)
-        await _wait_idle(page, timeout_ms)
-    except PlaywrightError:
-        _log.warning("capture_detail_navigation_failed")
-
-
-async def _load_library(page: CapturePage, settings: Settings) -> None:
-    timeout_ms = settings.http_timeout_s * MS_PER_S
-    await page.goto(HUMBLE_BASE + LIBRARY_PATH, timeout=timeout_ms)
-    for _ in range(SCROLL_STEPS):
-        await page.mouse.wheel(0, SCROLL_DELTA_PX)
-        await _wait_idle(page, timeout_ms)
-    await _open_detail(page, timeout_ms)
+async def _drain_records(collector: ResponseCollector) -> list[Record]:
+    return [await _page_record(response) for response in collector.drain()]
 
 
 async def _record_library_page(ctx: CaptureContext, settings: Settings) -> list[Record]:
-    collector = _ResponseCollector(MAX_PAGE_RESPONSES)
+    """List page, then one bundle's detail page and one signed-URL request.
+
+    Bodies are read after each page settles and before navigating away.
+    """
+    collector = ResponseCollector(MAX_PAGE_RESPONSES)
+    timeout_ms = settings.http_timeout_s * MS_PER_S
     try:
         page = await ctx.new_page()
         page.on("response", collector.add)
-        await _load_library(page, settings)
-        return [await _page_record(response) for response in collector.responses]
+        await load_library(page, timeout_ms)
+        bundle_id = await first_bundle_id(page)
+        records = await _drain_records(collector)
+        if bundle_id is not None and await open_bundle(page, bundle_id, timeout_ms):
+            await request_signed_urls(page, timeout_ms)
+        return records + await _drain_records(collector)
     except PlaywrightError as exc:
         raise CaptureError("Library page capture failed: browser error") from exc
 

@@ -15,6 +15,7 @@ from humble_dl.api.sanitize import (
     identity_pattern,
     identity_terms,
     list_gamekeys,
+    redact_offsite_url,
     redact_text,
     redact_value,
     sanitize,
@@ -258,3 +259,38 @@ def test_flight_payload_is_json_serializable_after_sanitize() -> None:
     payload: Any = {"a": [1, {"gamekey": "K"}]}
 
     assert json.loads(json.dumps(sanitize(payload, {}))) == {"a": [1, {"gamekey": "GAMEKEY_0001"}]}
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # Site URLs: only query/fragment removed.
+        (
+            "https://www.humblebundle.com/home/library/abc?x=1#f",
+            "https://www.humblebundle.com/home/library/abc",
+        ),
+        # Off-site: host plus a filename-like last segment; any path token is dropped.
+        ("https://dl.humble.com/f.pdf?ttl=1&t=sig", "https://dl.humble.com/f.pdf"),
+        (
+            "https://cdn.x.net/SIGNEDTOKEN123/sub/book.epub?a=b",
+            "https://cdn.x.net/REDACTED/book.epub",
+        ),
+        (
+            "https://cdn.x.net/aaaa.bbbbbbbbbbbbbbbbbbbbbbbbb.cccccccccccccccc",
+            "https://cdn.x.net/REDACTED",
+        ),
+        ("https://cdn.x.net/tokenonly", "https://cdn.x.net/REDACTED"),
+        ("https://user:pw@cdn.x.net/a/b.mobi", "https://cdn.x.net/REDACTED/b.mobi"),
+        ("https://cdn.x.net", "https://cdn.x.net"),
+    ],
+)
+def test_redact_offsite_url(url: str, expected: str) -> None:
+    assert redact_offsite_url(url) == expected
+
+
+def test_sanitize_reduces_offsite_signed_urls_in_values() -> None:
+    body = {"signedUrls": {"m": {"k": {"web": "https://cdn.x.net/TOKEN9/k.epub?Signature=abc"}}}}
+
+    assert sanitize(body, {}) == {
+        "signedUrls": {"m": {"k": {"web": "https://cdn.x.net/REDACTED/k.epub"}}}
+    }

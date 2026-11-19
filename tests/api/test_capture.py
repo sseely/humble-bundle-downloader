@@ -27,6 +27,7 @@ from humble_dl.api.capture import (
     build_outputs,
     run_capture,
 )
+from humble_dl.api.capture_page import DISABLE_WINDOW_OPEN_JS, FORMAT_BUTTON_SELECTOR
 from humble_dl.auth.session import (
     HUMBLE_BASE,
     BotChallengeError,
@@ -137,6 +138,8 @@ class FakeMouse:
 
 
 class FakePage:
+    """Models Playwright: bodies of responses from an earlier page are evicted on goto."""
+
     def __init__(
         self,
         responses: list[FakeResponse],
@@ -145,19 +148,32 @@ class FakePage:
         scripts: list[Any] | None = None,
         detail_responses: list[FakeResponse] | None = None,
         detail_error: Exception | None = None,
+        click_responses: list[FakeResponse] | None = None,
+        click_error: Exception | None = None,
     ) -> None:
         self.mouse = FakeMouse()
         self.scripts = scripts or []
         self.detail_responses = detail_responses or []
         self.detail_error = detail_error
+        self.click_responses = click_responses or []
+        self.click_error = click_error
         self.responses = responses
         self.goto_error = goto_error
         self.idle_error = idle_error
         self.handlers: list[Callable[[Any], None]] = []
         self.visited: list[str] = []
+        self.evaluated: list[str] = []
+        self.clicked: list[str] = []
+        self.emitted: list[FakeResponse] = []
 
     def on(self, event: Literal["response"], f: Callable[[Any], None]) -> None:
         self.handlers.append(f)
+
+    def _emit(self, responses: list[FakeResponse]) -> None:
+        for response in responses:
+            self.emitted.append(response)
+            for handler in self.handlers:
+                handler(response)
 
     async def goto(self, url: str, *, timeout: float | None = None) -> object:
         self.visited.append(url)
@@ -165,9 +181,9 @@ class FakePage:
         error = self.goto_error if first else self.detail_error
         if error is not None:
             raise error
-        for response in self.responses if first else self.detail_responses:
-            for handler in self.handlers:
-                handler(response)
+        for old in self.emitted:
+            old.text_error = old.text_error or PlaywrightError("body evicted by navigation")
+        self._emit(self.responses if first else self.detail_responses)
         return None
 
     async def wait_for_load_state(
@@ -178,6 +194,16 @@ class FakePage:
 
     async def eval_on_selector_all(self, selector: str, expression: str) -> Any:
         return self.scripts
+
+    async def evaluate(self, expression: str) -> Any:
+        self.evaluated.append(expression)
+        return None
+
+    async def click(self, selector: str, *, timeout: float | None = None) -> None:
+        self.clicked.append(selector)
+        if self.click_error is not None:
+            raise self.click_error
+        self._emit(self.click_responses)
 
 
 class FakeContext:
@@ -796,6 +822,53 @@ async def test_run_capture_continues_when_detail_navigation_fails(tmp_path: Path
 
     assert [p.name for p in written] == [INDEX_NAME]
     assert ctx.page.visited == [LIBRARY_URL, DETAIL_URL]
+
+
+SIGNED_RSC = (
+    '0:{"a":"$@1"}\n'
+    '1:{"ok":true,"data":{"signedUrls":{"m":{"k":{"web":'
+    '"https://cdn.x.net/TOKEN9SECRET/k.epub?Signature=abc"}}},"expiresAt":"2026-11-20T00:00:00Z"}}\n'
+)
+
+
+async def test_run_capture_reads_list_bodies_before_opening_bundle(tmp_path: Path) -> None:
+    listing = FakeResponse(url=LIBRARY_URL, body=library_html(FLIGHT_TEXT), headers=HTML_HEADERS)
+    detail = FakeResponse(url=DETAIL_URL, body=library_html(FLIGHT_TEXT), headers=HTML_HEADERS)
+    ctx = make_ctx([listing], scripts=[BUNDLE_SCRIPT], detail_responses=[detail])
+
+    written = await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
+
+    names = [p.name for p in written]
+    assert names[:2] == ["01-library-flight.rsc.txt", "02-library-detail-flight.rsc.txt"]
+
+
+async def test_run_capture_requests_signed_urls_with_window_open_disabled(tmp_path: Path) -> None:
+    signed = FakeResponse(url=DETAIL_URL, method="POST", body=SIGNED_RSC, headers=RSC_HEADERS)
+    ctx = make_ctx(scripts=[BUNDLE_SCRIPT], click_responses=[signed])
+    out_dir = tmp_path / "o"
+
+    written = await capture_run(ctx, make_settings(tmp_path), out_dir, sleep=FakeSleep())
+
+    assert ctx.page.evaluated == [DISABLE_WINDOW_OPEN_JS]
+    assert ctx.page.clicked == [FORMAT_BUTTON_SELECTOR]
+    text = written[0].read_text(encoding="utf-8")
+    assert '"web":"https://cdn.x.net/REDACTED/k.epub"' in text
+    assert "TOKEN9SECRET" not in all_output_text(out_dir)
+    assert "Signature" not in all_output_text(out_dir)
+
+
+async def test_run_capture_logs_and_continues_when_format_click_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    detail = FakeResponse(url=DETAIL_URL, body=library_html(FLIGHT_TEXT), headers=HTML_HEADERS)
+    ctx = make_ctx(
+        scripts=[BUNDLE_SCRIPT], detail_responses=[detail], click_error=PlaywrightError("none")
+    )
+
+    written = await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
+
+    assert written[0].name == "01-library-detail-flight.rsc.txt"
+    assert "capture_format_click_failed" in capsys.readouterr().err
 
 
 async def test_run_capture_skips_oversized_body_and_empty_flight(tmp_path: Path) -> None:

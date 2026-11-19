@@ -7,7 +7,7 @@ Captured output is committed as test fixtures, so everything here fails closed:
 import re
 from collections.abc import Iterable, Iterator
 from typing import Any, cast
-from urllib.parse import quote, quote_plus, unquote
+from urllib.parse import quote, quote_plus, unquote, urlsplit
 
 from humble_dl.api.rsc import (
     KIND_JSON,
@@ -63,6 +63,10 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-
 URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 GAMEKEY_JSON_RE = re.compile(r'\\?"gamekey\\?"\s*:\s*\\?"([^"\\]+)')
 GIFT_PATH_RE = re.compile(r"/gift/([A-Za-z0-9_-]+)")
+# Off-site (e.g. signed download) URLs may carry a token in the path, so only the
+# host and a filename-like last segment survive.
+SITE_HOSTS = frozenset({"humblebundle.com", "www.humblebundle.com"})
+FILENAME_SEGMENT_RE = re.compile(r"[\w+-][\w.+-]{0,119}\.[A-Za-z0-9]{1,8}")
 KEY_QUERY_RE = re.compile(r"[?&;](?:key|gamekey)=([^&\s\"'<>\\#]+)", re.IGNORECASE)
 
 
@@ -107,11 +111,28 @@ def _replace_gamekeys(text: str, gamekey_map: dict[str, str]) -> str:
     return pattern.sub(lambda match: fakes[match.group(0).lower()], text)
 
 
+def redact_offsite_url(url: str) -> str:
+    """Strip userinfo, query and fragment; off-site URLs also lose all but a filename.
+
+    Site URLs keep their path. Off-site URLs become ``scheme://host/[REDACTED/]name``
+    where ``name`` is kept only if it looks like a file name, else ``REDACTED``.
+    """
+    redacted = redact_url(url)
+    parts = urlsplit(redacted)
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if (parts.hostname or "").lower() in SITE_HOSTS or not segments:
+        return redacted
+    last = segments[-1]
+    tail = last if FILENAME_SEGMENT_RE.fullmatch(last) else REDACTED
+    prefix = f"{REDACTED}/" if len(segments) > 1 else ""
+    return f"{parts.scheme}://{parts.netloc}/{prefix}{tail}"
+
+
 def sanitize_string(text: str, gamekey_map: dict[str, str]) -> str:
-    """Replace gamekeys and emails and strip URL queries/fragments in ``text``."""
+    """Replace gamekeys and emails and redact URLs (``redact_offsite_url``) in ``text``."""
     text = _replace_gamekeys(text, gamekey_map)
     text = EMAIL_RE.sub(EMAIL_PLACEHOLDER, text)
-    return URL_RE.sub(lambda match: redact_url(match.group(0)), text)
+    return URL_RE.sub(lambda match: redact_offsite_url(match.group(0)), text)
 
 
 def _sanitize_dict(obj: dict[str, Any], gamekey_map: dict[str, str]) -> dict[str, Any]:
