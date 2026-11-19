@@ -195,6 +195,15 @@ def test_capture_default_out_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     assert rec.capture_out == [cli.DEFAULT_CAPTURE_DIR]
 
 
+def test_sync_failed_bundle_exits_4_and_names_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = Summary(1, 0, 1, 0, 0, 10, 1.0, [], failed_bundles=["Humble Comics Bundle: X"])
+    install_sync(monkeypatch, Recorder(), SyncRecorder(summary))
+    result = invoke("sync")
+    assert result.exit_code == cli.EXIT_FILES
+    assert "1 bundle(s) could not be loaded:" in result.stderr
+    assert "Humble Comics Bundle: X" in result.stderr
+
+
 @pytest.mark.parametrize(
     ("error", "code", "fragment"),
     [

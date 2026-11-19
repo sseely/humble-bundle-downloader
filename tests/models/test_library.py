@@ -12,6 +12,7 @@ from humble_dl.models.library import (
     FileVersion,
     Order,
     SchemaDriftError,
+    SignedUrlsError,
     Subproduct,
     apply_signed_urls,
     ebook_items,
@@ -218,14 +219,26 @@ def test_parse_signed_urls_merges_machines() -> None:
 
 
 @pytest.mark.parametrize(
-    "text",
+    ("payload", "code", "retryable"),
     [
-        flight_row("1", {"ok": False, "data": {}}),
-        flight_row("0", {"a": 1}),
-        "",
+        # Observed live 2026-11-19 for a comics bundle.
+        ({"ok": False, "code": "upstream_error", "retryable": True}, "upstream_error", True),
+        ({"ok": False, "code": "forbidden"}, "forbidden", False),
+        ({"ok": False}, "unknown", False),
     ],
 )
-def test_parse_signed_urls_not_ok_raises(text: str) -> None:
+def test_parse_signed_urls_not_ok_raises_signed_urls_error(
+    payload: dict[str, object], code: str, retryable: bool
+) -> None:
+    with pytest.raises(SignedUrlsError) as info:
+        parse_signed_urls(flight_row("1", payload))
+
+    assert (info.value.code, info.value.retryable) == (code, retryable)
+    assert code in str(info.value)
+
+
+@pytest.mark.parametrize("text", [flight_row("0", {"a": 1}), ""])
+def test_parse_signed_urls_missing_ok_row_is_drift(text: str) -> None:
     with pytest.raises(SchemaDriftError) as info:
         parse_signed_urls(text)
 

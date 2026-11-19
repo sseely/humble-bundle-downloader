@@ -81,6 +81,7 @@ MSG_SYNC_SUMMARY = (
 MSG_DRY_LINE = "{verb} {relative} ({size})"
 MSG_DRY_TOTAL = "Dry run: {count} files to fetch, {bytes} known bytes."
 MSG_FAILED_FILES = "{count} file(s) failed:"
+MSG_FAILED_BUNDLES = "{count} bundle(s) could not be loaded:"
 UNKNOWN_SIZE = "size unknown"
 VERB_FETCH = "fetch"
 VERB_REPLACE = "archive+fetch"
@@ -245,9 +246,21 @@ def _report_sync(summary: Summary, settings: Settings, opts: SyncOptions) -> Non
             typer.echo(line)
         typer.echo(_dry_run_total(summary))
     typer.echo(MSG_SYNC_SUMMARY.format(**vars(summary)))
+    problems = _failure_sections(summary)
+    if problems:
+        raise SyncFailedError("\n".join(problems))
+
+
+def _failure_sections(summary: Summary) -> list[str]:
+    sections: list[str] = []
     if summary.failures:
         listing = "\n".join(f"  {path}" for path in summary.failures)
-        raise SyncFailedError(f"{MSG_FAILED_FILES.format(count=summary.failed)}\n{listing}")
+        sections.append(f"{MSG_FAILED_FILES.format(count=summary.failed)}\n{listing}")
+    if summary.failed_bundles:
+        listing = "\n".join(f"  {title}" for title in summary.failed_bundles)
+        count = len(summary.failed_bundles)
+        sections.append(f"{MSG_FAILED_BUNDLES.format(count=count)}\n{listing}")
+    return sections
 
 
 async def _sync(settings: Settings, opts: SyncOptions) -> Summary:

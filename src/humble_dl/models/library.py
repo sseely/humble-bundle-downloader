@@ -21,6 +21,9 @@ UNDEFINED = "$undefined"
 KEY_BUNDLE_ITEMS = "bundleItems"
 KEY_LIBRARY_ITEM = "userLibraryItem"
 KEY_OK = "ok"
+KEY_CODE = "code"
+KEY_RETRYABLE = "retryable"
+UNKNOWN_CODE = "unknown"
 KEY_PRODUCT_ENTITLEMENT_ID = "productEntitlementId"
 KEY_ID = "id"
 KEY_TYPE = "type"
@@ -39,6 +42,20 @@ class SchemaDriftError(Exception):
     def __init__(self, path: str, detail: str) -> None:
         super().__init__(f"Library schema drift at '{path}': {detail}")
         self.path = path
+
+
+class SignedUrlsError(Exception):
+    """The signed-URL action answered ``ok: false`` (an API error, not drift).
+
+    Attributes:
+        code: Humble's error code (e.g. ``"upstream_error"``), or ``"unknown"``.
+        retryable: Humble's own hint that the same request may succeed later.
+    """
+
+    def __init__(self, code: str, retryable: bool) -> None:
+        super().__init__(f"signed-URL request failed: {code} (retryable={retryable})")
+        self.code = code
+        self.retryable = retryable
 
 
 class FileVersion(BaseModel):
@@ -371,6 +388,13 @@ def _signed_response_payload(text: str) -> dict[str, object] | None:
     return None
 
 
+def _signed_urls_error(payload: dict[str, object]) -> SignedUrlsError:
+    code = payload.get(KEY_CODE)
+    return SignedUrlsError(
+        code if isinstance(code, str) else UNKNOWN_CODE, payload.get(KEY_RETRYABLE) is True
+    )
+
+
 def parse_signed_urls(text: str) -> dict[str, dict[str, str]]:
     """Parse a signed-URL server action response.
 
@@ -381,12 +405,16 @@ def parse_signed_urls(text: str) -> dict[str, dict[str, str]]:
         ``{download_key: {filename: signed_url}}``, merged across machines.
 
     Raises:
-        SchemaDriftError: If the ``ok`` row is missing or not ``true``, or
-            ``data.signedUrls`` is malformed.
+        SignedUrlsError: The response is ``ok: false`` (carries Humble's
+            ``code`` and ``retryable`` hint).
+        SchemaDriftError: The ``ok`` row is missing or ``data.signedUrls``
+            is malformed.
     """
     payload = _signed_response_payload(text)
-    if payload is None or payload[KEY_OK] is not True:
-        raise SchemaDriftError(KEY_OK, "signed-url response missing or not ok")
+    if payload is None:
+        raise SchemaDriftError(KEY_OK, "signed-url response has no ok row")
+    if payload[KEY_OK] is not True:
+        raise _signed_urls_error(payload)
     try:
         response = _SignedResponse.model_validate(payload)
     except ValidationError as exc:

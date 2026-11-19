@@ -7,12 +7,13 @@ small pure helpers for filtering, refresh mapping and summarising.
 import asyncio
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
 
 import httpx
 
+from humble_dl.api.client import LibraryApiError
 from humble_dl.config import Settings
 from humble_dl.lib.hashcache import HashCache
 from humble_dl.lib.logging import get_logger
@@ -24,6 +25,7 @@ from humble_dl.workers.downloader import Result, execute
 EVENT_STARTED = "sync_started"
 EVENT_COMPLETE = "sync_complete"
 EVENT_MISSING_URLS = "signed_urls_missing"
+EVENT_BUNDLE_FAILED = "bundle_failed"
 STATUS_DOWNLOADED = "downloaded"
 STATUS_ARCHIVED = "archived_and_downloaded"
 STATUS_SKIPPED = "skipped"
@@ -80,7 +82,9 @@ class Summary:
 
     ``downloaded`` counts every file written (including archived-and-replaced
     ones); ``archived`` counts the subset whose old version was archived. For a
-    dry run only ``planned``, ``skipped`` and ``actions`` are populated.
+    dry run only ``planned``, ``skipped``, ``actions`` and ``failed_bundles``
+    are populated. ``failed_bundles`` lists titles of bundles that could not be
+    loaded (their files were not planned).
     """
 
     planned: int
@@ -92,6 +96,7 @@ class Summary:
     duration_s: float
     failures: list[Path]
     actions: list[Action] = field(default_factory=lambda: list[Action]())
+    failed_bundles: list[str] = field(default_factory=lambda: list[str]())
 
 
 def filter_bundles(bundles: Iterable[BundleRef], only: str | None) -> list[BundleRef]:
@@ -175,14 +180,24 @@ def _dry_summary(actions: list[Action], duration_s: float) -> Summary:
     return Summary(len(actions), skipped, 0, 0, 0, 0, duration_s, [], actions)
 
 
-async def _load_orders(deps: SyncDeps, opts: SyncOptions) -> list[Order]:
+async def _load_orders(deps: SyncDeps, opts: SyncOptions) -> tuple[list[Order], list[str]]:
+    """Load each bundle; a bundle whose request fails is skipped, not fatal.
+
+    Session, bot-challenge and schema-drift errors still abort the run.
+    """
     orders: list[Order] = []
+    failed: list[str] = []
     for bundle in filter_bundles(await deps.library.list_bundles(), opts.only):
-        order, missing = await deps.library.get_order(bundle.id)
+        try:
+            order, missing = await deps.library.get_order(bundle.id)
+        except LibraryApiError as exc:
+            _log.error(EVENT_BUNDLE_FAILED, extra={"bundle": bundle.title, "error": str(exc)})
+            failed.append(bundle.title)
+            continue
         if missing:
             _log.warning(EVENT_MISSING_URLS, extra={"count": len(missing)})
         orders.append(order)
-    return orders
+    return orders, failed
 
 
 def make_refresh(
@@ -230,6 +245,7 @@ def _log_complete(summary: Summary) -> None:
             "archived": summary.archived,
             "bytes": summary.bytes,
             "duration_s": summary.duration_s,
+            "failed_bundles": len(summary.failed_bundles),
         },
     )
 
@@ -253,7 +269,7 @@ async def run_sync(settings: Settings, opts: SyncOptions, deps: SyncDeps) -> Sum
         EVENT_STARTED,
         extra={"output_dir": str(settings.output_dir), "dry_run": opts.dry_run, "only": opts.only},
     )
-    orders = await _load_orders(deps, opts)
+    orders, failed_bundles = await _load_orders(deps, opts)
     plan_ = plan(orders, settings.output_dir, deps.cache.local_file)
     _check_space(plan_.bytes_to_fetch, settings.output_dir, deps.free_bytes)
     if opts.dry_run:
@@ -263,5 +279,6 @@ async def run_sync(settings: Settings, opts: SyncOptions, deps: SyncDeps) -> Sum
         results = await execute(plan_.actions, deps.http, refresh, settings, sleep=deps.sleep)
         _record_hashes(deps.cache, results)
         summary = summarize(plan_.actions, results, deps.clock() - started)
+    summary = replace(summary, failed_bundles=failed_bundles)
     _log_complete(summary)
     return summary

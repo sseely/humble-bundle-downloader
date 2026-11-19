@@ -9,6 +9,7 @@ import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
+from humble_dl.api.client import LibraryApiError
 from humble_dl.config import Settings, load_settings
 from humble_dl.lib.hashcache import HashCache
 from humble_dl.models.library import BundleRef, Download, FileVersion, Order, Subproduct
@@ -230,6 +231,33 @@ async def test_failure_reported_and_other_files_continue(
         )
     assert (summary.downloaded, summary.failed) == (1, 1)
     assert summary.failures == [settings.output_dir / "Python Bundle" / "Book" / "alpha.epub"]
+
+
+@dataclass
+class FlakyLibrary(FakeLibrary):
+    """get_order fails for chosen bundles, as the client does after retries."""
+
+    failing: frozenset[str] = frozenset()
+
+    async def get_order(self, bundle_id: str) -> tuple[Order, list[str]]:
+        if bundle_id in self.failing:
+            raise LibraryApiError("signed-URL request for /home/library/x failed: upstream_error")
+        return await super().get_order(bundle_id)
+
+
+async def test_bundle_failure_is_isolated_and_reported(
+    settings: Settings, cache: HashCache, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=ALPHA.url, content=ALPHA.body)
+    library = FlakyLibrary(two_bundles().orders, failing=frozenset({"k2"}))
+    async with httpx.AsyncClient() as client:
+        summary = await run_sync(settings, SyncOptions(False, None), deps(library, client, cache))
+
+    assert summary.failed_bundles == ["Cooking Bundle"]
+    assert (summary.planned, summary.downloaded, summary.failed) == (1, 1, 0)
+    assert (
+        settings.output_dir / "Python Bundle" / "Book" / "alpha.epub"
+    ).read_bytes() == ALPHA.body
 
 
 def test_filter_bundles() -> None:

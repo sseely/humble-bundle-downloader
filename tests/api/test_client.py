@@ -25,7 +25,7 @@ from humble_dl.api.client import (
 )
 from humble_dl.auth.session import BotChallengeError, SessionExpiredError
 from humble_dl.config import Settings, load_settings
-from humble_dl.models.library import FileVersion, Order, SchemaDriftError, Subproduct
+from humble_dl.models.library import FileVersion, Order, SchemaDriftError, Subproduct, ebook_items
 
 FIXTURES = Path(__file__).parent.parent / "helpers" / "fixtures" / "library"
 BUNDLE_ID = "00000000-0000-4000-8000-000000000054"
@@ -235,6 +235,53 @@ async def test_retries_exhausted(settings: Settings, fake_time: FakeTime) -> Non
         await make(page, settings, fake_time).get_order(BUNDLE_ID)
     assert len(page.action_calls) == 5
     assert [d for d in fake_time.sleeps if d >= 1] == [1, 2, 4, 8]
+
+
+UPSTREAM_ERROR = '0:{"a":"$@1"}\n1:{"ok":false,"code":"upstream_error","retryable":true}\n'
+FORBIDDEN_ERROR = '0:{"a":"$@1"}\n1:{"ok":false,"code":"forbidden","retryable":false}\n'
+
+
+async def test_retryable_signed_url_error_is_retried(
+    settings: Settings, fake_time: FakeTime
+) -> None:
+    # Observed live: HTTP 200 with {"ok":false,"code":"upstream_error","retryable":true}.
+    page = bundle_page()
+    ok = (200, fixture("signed_urls.rsc.txt"))
+    page.action_responses = [(200, UPSTREAM_ERROR), (200, UPSTREAM_ERROR), ok]
+
+    order, _ = await make(page, settings, fake_time).get_order(BUNDLE_ID)
+
+    assert len(page.action_calls) == 3
+    assert [d for d in fake_time.sleeps if d >= 1] == [1, 2]
+    assert any(
+        f.url.startswith("https://cdn.example.invalid/") for _, fs in ebook_items(order) for f in fs
+    )
+    assert list(settings.debug_dir.glob("*")) == []
+
+
+async def test_retryable_signed_url_error_exhausted(
+    settings: Settings, fake_time: FakeTime
+) -> None:
+    page = bundle_page()
+    page.action_responses = [(200, UPSTREAM_ERROR)]
+
+    with pytest.raises(LibraryApiError, match="upstream_error"):
+        await make(page, settings, fake_time).get_order(BUNDLE_ID)
+
+    assert len(page.action_calls) == 5
+    assert [d for d in fake_time.sleeps if d >= 1] == [1, 2, 4, 8]
+
+
+async def test_non_retryable_signed_url_error_fails_immediately(
+    settings: Settings, fake_time: FakeTime
+) -> None:
+    page = bundle_page()
+    page.action_responses = [(200, FORBIDDEN_ERROR)]
+
+    with pytest.raises(LibraryApiError, match="forbidden"):
+        await make(page, settings, fake_time).get_order(BUNDLE_ID)
+
+    assert len(page.action_calls) == 1
 
 
 async def test_action_challenge(settings: Settings, fake_time: FakeTime) -> None:

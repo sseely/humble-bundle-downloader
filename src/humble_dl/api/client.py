@@ -33,6 +33,7 @@ from humble_dl.models.library import (
     BundleRef,
     Order,
     SchemaDriftError,
+    SignedUrlsError,
     apply_signed_urls,
     ebook_items,
     parse_bundle,
@@ -273,9 +274,26 @@ class LibraryClient:
             raise
 
     async def _signed_batch(self, page_url: str, ids: list[str]) -> dict[str, dict[str, str]]:
+        """Signed URLs for ``ids``; app-level ``ok:false`` errors marked
+        retryable by Humble are retried with the same backoff as 429/5xx."""
         action_id = await self._ensure_action_id()
-        body = await self._call_action(page_url, action_id, [ids])
-        return self._parse(KIND_SIGNED, body, parse_signed_urls)
+        attempt = 1
+        while True:
+            body = await self._call_action(page_url, action_id, [ids])
+            try:
+                return self._parse(KIND_SIGNED, body, parse_signed_urls)
+            except SignedUrlsError as exc:
+                if not exc.retryable or attempt >= MAX_ATTEMPTS:
+                    path = redact_url(page_url)
+                    raise LibraryApiError(
+                        f"signed-URL request for {path} failed: {exc.code}"
+                    ) from exc
+                delay = backoff_delay(attempt)
+                _log.warning(
+                    "api_backoff", extra={"delay": delay, "attempt": attempt, "code": exc.code}
+                )
+                await self._sleep(delay)
+                attempt += 1
 
     async def _call_action(self, page_url: str, action_id: str, args: list[list[str]]) -> str:
         path = redact_url(page_url)

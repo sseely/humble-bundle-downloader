@@ -103,7 +103,7 @@ planned files and stops without writing anything if it does not.
 | 1 | Configuration, disk space, library or browser error |
 | 2 | Not logged in, session expired, or a bot challenge |
 | 3 | Humble's data no longer matches the expected format |
-| 4 | One or more files failed to download (each path is printed) |
+| 4 | One or more files failed to download, or a bundle could not be loaded (each is listed) |
 
 ## Configuration
 
@@ -125,9 +125,11 @@ parsers in `src/humble_dl/models/library.py` (or open an issue with the
 capture). Debug files can contain short-lived download links; do not share
 them.
 
-**Exit 4: some files failed.**
-Usually a network problem or an expired download link. Re-run `sync`; files
-that already finished are skipped and the failed ones are retried.
+**Exit 4: some files or bundles failed.**
+Usually a network problem, an expired download link, or a temporary Humble
+server error (`upstream_error`). Re-run `sync`; files that already finished
+are skipped and the failed ones are retried. Other bundles still download
+when one bundle fails.
 
 ## Development
 
