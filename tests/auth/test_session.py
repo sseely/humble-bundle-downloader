@@ -13,8 +13,9 @@ from playwright.async_api import Error as PlaywrightError
 
 from humble_dl.auth import session
 from humble_dl.auth.session import (
+    AUTH_BASE,
     HUMBLE_BASE,
-    SESSION_PROBE_PATH,
+    SESSION_PROBE_URL,
     BotChallengeError,
     ProbeVerdict,
     SessionCheckError,
@@ -22,6 +23,7 @@ from humble_dl.auth.session import (
     SessionExpiredError,
     assert_logged_in,
     classify_probe,
+    fetch_identity_secrets,
     interactive_login,
     open_context,
     prepare_profile_dir,
@@ -32,6 +34,18 @@ LOGIN_TIMEOUT_S = 10.0
 API_TIMEOUT_S = 7.0
 HTTP_TIMEOUT_S = 20.0
 LOGIN_REDIRECT = "/login?goto=%2Fhome"
+KRATOS_REDIRECT = f"{AUTH_BASE}/self-service/login/browser?return_to=x"
+EMAIL = "user@example.com"
+NAME = "Jane Doe"
+IDENTITY_ID = "id-identity-1"
+SESSION_ID = "id-session-2"
+WHOAMI_BODY = {
+    "id": SESSION_ID,
+    "identity": {
+        "id": IDENTITY_ID,
+        "traits": {"email": EMAIL, "name": {"first": "Jane", "last": "Doe"}, "tags": [NAME, ""]},
+    },
+}
 CHALLENGE_BODY = "<html>Just a moment... cf-chl</html>"
 LEAK_BODY = "SECRET-BODY-TEXT"
 LEAK_COOKIE = "session=abc123"
@@ -56,9 +70,15 @@ class FakeResponse:
     status: int
     headers: dict[str, str] = field(default_factory=lambda: {})
     body: str = ""
+    json_body: Any = None
 
     async def text(self) -> str:
         return self.body
+
+    async def json(self) -> Any:
+        if isinstance(self.json_body, Exception):
+            raise self.json_body
+        return self.json_body
 
 
 class FakeRequester:
@@ -122,6 +142,8 @@ def real_context_as_session(real: BrowserContext) -> SessionContext:
         (401, None, CHALLENGE_BODY, ProbeVerdict.EXPIRED),
         (302, LOGIN_REDIRECT, "", ProbeVerdict.EXPIRED),
         (302, f"{HUMBLE_BASE}/login", "", ProbeVerdict.EXPIRED),
+        (307, KRATOS_REDIRECT, "", ProbeVerdict.EXPIRED),
+        (307, "/self-service/login/browser", "", ProbeVerdict.EXPIRED),
         (302, "/home", "", ProbeVerdict.UNEXPECTED),
         (302, None, "", ProbeVerdict.UNEXPECTED),
         (500, None, "", ProbeVerdict.UNEXPECTED),
@@ -140,7 +162,23 @@ def test_bot_challenge_is_session_expired_subclass() -> None:
 async def test_assert_logged_in_ok_uses_probe_url_timeout_and_no_redirects(tmp_path: Path) -> None:
     ctx = ctx_of(200)
     await assert_logged_in(as_session(ctx), make_settings(tmp_path))
-    assert ctx.request.calls == [(HUMBLE_BASE + SESSION_PROBE_PATH, API_TIMEOUT_S * 1000, 0)]
+    assert ctx.request.calls == [(SESSION_PROBE_URL, API_TIMEOUT_S * 1000, 0)]
+
+
+def test_probe_url_is_kratos_whoami() -> None:
+    assert SESSION_PROBE_URL == "https://auth.humblebundle.com/sessions/whoami"
+
+
+async def test_assert_logged_in_403_without_markers_is_expired(tmp_path: Path) -> None:
+    with pytest.raises(SessionExpiredError) as info:
+        await assert_logged_in(as_session(ctx_of(403)), make_settings(tmp_path))
+    assert type(info.value) is SessionExpiredError
+
+
+async def test_assert_logged_in_kratos_redirect_raises_expired(tmp_path: Path) -> None:
+    ctx = FakeContext([FakeResponse(307, {"location": KRATOS_REDIRECT})])
+    with pytest.raises(SessionExpiredError):
+        await assert_logged_in(as_session(ctx), make_settings(tmp_path))
 
 
 async def test_assert_logged_in_401_raises_expired(tmp_path: Path) -> None:
@@ -228,7 +266,7 @@ async def test_interactive_login_returns_after_third_probe(
     )
     assert len(ctx.request.calls) == 3
     assert rec.sleeps == [1.5, 1.5]
-    assert ctx.page.visited == [(HUMBLE_BASE + "/login", HTTP_TIMEOUT_S * 1000)]
+    assert ctx.page.visited == [(HUMBLE_BASE + "/home/library", HTTP_TIMEOUT_S * 1000)]
     captured = capsys.readouterr()
     assert session.LOGIN_INSTRUCTION in captured.err
     assert captured.out == ""
@@ -249,6 +287,82 @@ async def test_interactive_login_times_out(
     assert len(ctx.request.calls) == 2
     assert rec.sleeps == [2.0]
     assert '"msg": "login_timed_out"' in capsys.readouterr().err
+
+
+async def test_interactive_login_survives_unexpected_probes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ctx = FakeContext(
+        [
+            FakeResponse(404, {"set-cookie": LEAK_COOKIE}, LEAK_BODY),
+            FakeResponse(404),
+            FakeResponse(200),
+        ]
+    )
+    rec = Recorder()
+    await interactive_login(
+        as_session(ctx), make_settings(tmp_path), poll_s=1.0, sleep=rec.sleep, clock=rec.clock
+    )
+    assert len(ctx.request.calls) == 3
+    err = capsys.readouterr().err
+    assert err.count('"msg": "session_check_unexpected"') == 2
+    assert LEAK_BODY not in err
+    assert LEAK_COOKIE not in err
+
+
+async def test_interactive_login_unexpected_forever_times_out(tmp_path: Path) -> None:
+    ctx = FakeContext([FakeResponse(404), PlaywrightError("net")])
+    rec = Recorder()
+    rec.step = 4.0
+    with pytest.raises(SessionExpiredError, match="timed out"):
+        await interactive_login(
+            as_session(ctx), make_settings(tmp_path), poll_s=2.0, sleep=rec.sleep, clock=rec.clock
+        )
+    assert len(ctx.request.calls) == 2
+
+
+async def test_fetch_identity_secrets_returns_traits_and_ids(tmp_path: Path) -> None:
+    ctx = FakeContext([FakeResponse(200, json_body=WHOAMI_BODY)])
+    result = await fetch_identity_secrets(as_session(ctx), make_settings(tmp_path))
+    assert result == [EMAIL, "Jane", "Doe", NAME, IDENTITY_ID, SESSION_ID]
+    assert ctx.request.calls == [(SESSION_PROBE_URL, API_TIMEOUT_S * 1000, 0)]
+
+
+async def test_fetch_identity_secrets_deduplicates(tmp_path: Path) -> None:
+    body = {"id": "x", "identity": {"id": "x", "traits": {"a": "x", "b": ["x", 5]}}}
+    ctx = FakeContext([FakeResponse(200, json_body=body)])
+    assert await fetch_identity_secrets(as_session(ctx), make_settings(tmp_path)) == ["x"]
+
+
+@pytest.mark.parametrize("body", [[], {"identity": "str"}, {}])
+async def test_fetch_identity_secrets_tolerates_odd_shapes(tmp_path: Path, body: Any) -> None:
+    ctx = FakeContext([FakeResponse(200, json_body=body)])
+    assert await fetch_identity_secrets(as_session(ctx), make_settings(tmp_path)) == []
+
+
+async def test_fetch_identity_secrets_empty_on_401(tmp_path: Path) -> None:
+    ctx = FakeContext([FakeResponse(401, json_body=WHOAMI_BODY)])
+    assert await fetch_identity_secrets(as_session(ctx), make_settings(tmp_path)) == []
+
+
+async def test_fetch_identity_secrets_wraps_playwright_error(tmp_path: Path) -> None:
+    original = PlaywrightError("bad json")
+    ctx = FakeContext([FakeResponse(200, json_body=original)])
+    with pytest.raises(SessionCheckError) as info:
+        await fetch_identity_secrets(as_session(ctx), make_settings(tmp_path))
+    assert info.value.__cause__ is original
+
+
+async def test_identity_values_never_logged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ctx = FakeContext([FakeResponse(200, json_body=WHOAMI_BODY)])
+    settings = make_settings(tmp_path)
+    await assert_logged_in(as_session(ctx), settings)
+    await fetch_identity_secrets(as_session(ctx), settings)
+    err = capsys.readouterr().err
+    for value in (EMAIL, NAME, IDENTITY_ID, SESSION_ID):
+        assert value not in err
 
 
 async def test_interactive_login_propagates_bot_challenge(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
 from playwright.async_api import BrowserContext, async_playwright
@@ -17,8 +17,15 @@ from humble_dl.config import Settings
 from humble_dl.lib.logging import get_logger
 
 HUMBLE_BASE = "https://www.humblebundle.com"
-SESSION_PROBE_PATH = "/api/v1/user/order"  # legacy; T12 may revise
-LOGIN_PATH = "/login"
+AUTH_BASE = "https://auth.humblebundle.com"
+# Ory Kratos whoami: 200 = active session, 401 = none, 403 = needs higher assurance.
+SESSION_PROBE_URL = AUTH_BASE + "/sessions/whoami"
+# Anonymous users are redirected to the Kratos login flow and returned here afterwards.
+LOGIN_PATH = "/home/library"
+LOGIN_REDIRECT_PATHS = ("/login", "/self-service/login")
+IDENTITY_KEY = "identity"
+TRAITS_KEY = "traits"
+ID_KEY = "id"
 PROFILE_DIR_MODE = 0o700
 MS_PER_S = 1000
 DEFAULT_POLL_S = 2.0
@@ -69,6 +76,7 @@ class _ResponseLike(Protocol):
     @property
     def headers(self) -> dict[str, str]: ...
     async def text(self) -> str: ...
+    async def json(self) -> Any: ...
 
 
 class _RequesterLike(Protocol):
@@ -103,7 +111,7 @@ def is_login_redirect(location: str | None) -> bool:
     """Return True if ``location`` points at the login page."""
     if not location:
         return False
-    return urlsplit(location).path.startswith(LOGIN_PATH)
+    return urlsplit(location).path.startswith(LOGIN_REDIRECT_PATHS)
 
 
 def classify_probe(status: int, location: str | None, body_snippet: str) -> ProbeVerdict:
@@ -160,13 +168,13 @@ async def _probe(ctx: SessionContext, settings: Settings) -> ProbeVerdict:
     """Issue the probe request and classify it; wraps Playwright errors."""
     try:
         response = await ctx.request.get(
-            HUMBLE_BASE + SESSION_PROBE_PATH,
+            SESSION_PROBE_URL,
             timeout=settings.api_timeout_s * MS_PER_S,
             max_redirects=0,
         )
         status = response.status
         _log.info("session_check", extra={"status": status})
-        body = ""
+        body = ""  # whoami 200 carries identity traits: only challenge bodies are read
         if status in CHALLENGE_STATUSES:
             body = (await response.text())[:BODY_SNIPPET_CHARS]
         return classify_probe(status, response.headers.get(LOCATION_HEADER), body)
@@ -194,6 +202,65 @@ async def assert_logged_in(ctx: SessionContext, settings: Settings) -> None:
     if verdict is ProbeVerdict.EXPIRED:
         raise SessionExpiredError("Session expired; run `humble-dl login`")
     raise SessionCheckError("Session probe returned an unexpected response")
+
+
+def _collect_strings(value: object) -> list[str]:
+    """Return every non-empty string found recursively in ``value`` (pure)."""
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, dict):
+        found: list[str] = []
+        for item in cast("dict[str, object]", value).values():
+            found.extend(_collect_strings(item))
+        return found
+    if isinstance(value, list):
+        return [text for item in cast("list[object]", value) for text in _collect_strings(item)]
+    return []
+
+
+def extract_identity_secrets(body: object) -> list[str]:
+    """Pull identity traits, identity id and session id out of a whoami body (pure).
+
+    Returns:
+        Deduplicated, order-stable non-empty strings.
+    """
+    if not isinstance(body, dict):
+        return []
+    top = cast("dict[str, object]", body)
+    identity = top.get(IDENTITY_KEY)
+    secrets: list[str] = []
+    if isinstance(identity, dict):
+        ident = cast("dict[str, object]", identity)
+        secrets.extend(_collect_strings(ident.get(TRAITS_KEY)))
+        secrets.extend(_collect_strings(ident.get(ID_KEY)))
+    secrets.extend(_collect_strings(top.get(ID_KEY)))
+    return list(dict.fromkeys(secrets))
+
+
+async def fetch_identity_secrets(ctx: SessionContext, settings: Settings) -> list[str]:
+    """Return the account holder's identifying strings for fixture redaction.
+
+    Values are never logged.
+
+    Args:
+        ctx: Browser context (or structural equivalent).
+        settings: Provides ``api_timeout_s``.
+
+    Returns:
+        Traits strings, identity id and session id; empty unless whoami is 200.
+
+    Raises:
+        SessionCheckError: Playwright failure while requesting or parsing.
+    """
+    try:
+        response = await ctx.request.get(
+            SESSION_PROBE_URL, timeout=settings.api_timeout_s * MS_PER_S, max_redirects=0
+        )
+        if response.status != HTTP_OK:
+            return []
+        return extract_identity_secrets(await response.json())
+    except PlaywrightError as exc:
+        raise SessionCheckError("Identity lookup failed: browser request error") from exc
 
 
 async def _open_login_page(ctx: SessionContext, settings: Settings) -> None:
@@ -224,7 +291,8 @@ async def interactive_login(
     Raises:
         SessionExpiredError: Login did not complete within ``login_timeout_s``.
         BotChallengeError: The probe was met with a bot challenge.
-        SessionCheckError: Unexpected probe result or Playwright failure.
+        SessionCheckError: The login page could not be opened. Probe failures
+            while polling are logged and retried until the timeout.
     """
     deadline = clock() + settings.login_timeout_s
     await _open_login_page(ctx, settings)
@@ -237,6 +305,8 @@ async def interactive_login(
             raise
         except SessionExpiredError:
             pass
+        except SessionCheckError:
+            _log.warning("session_check_unexpected")
         else:
             _log.info("login_succeeded")
             return
