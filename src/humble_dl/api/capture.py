@@ -28,7 +28,8 @@ from humble_dl.api.rsc import (
     classify_response,
     extract_flight_from_html,
     is_humble_host,
-    select_detail_href,
+    library_detail_path,
+    select_bundle_id,
 )
 from humble_dl.api.sanitize import (
     EMAIL_PLACEHOLDER,
@@ -74,7 +75,6 @@ __all__ = [
     "list_gamekeys",
     "run_capture",
     "sanitize",
-    "select_detail_href",
 ]
 
 USER_ORDER_PATH = "/api/v1/user/order"
@@ -97,6 +97,7 @@ JSON_INDENT = 2
 SLUG_MAX_CHARS = 80
 EMPTY_SLUG = "root"
 FLIGHT_SLUG = "library-flight"
+DETAIL_FLIGHT_SLUG = "library-detail-flight"
 INDEX_HEADER = (
     "# Captured library traffic\n\n"
     "| NN | Method | Status | URL | File | Kind |\n"
@@ -104,8 +105,8 @@ INDEX_HEADER = (
 )
 NO_FILE = "-"
 
-LINK_SELECTOR = "a[href]"
-HREF_JS = "els => els.map(e => e.getAttribute('href'))"
+SCRIPT_SELECTOR = "script"
+SCRIPT_TEXT_JS = "els => els.map(e => e.textContent)"
 
 ORDER_PATH_RE = re.compile(rf"^{re.escape(ORDER_PATH_PREFIX)}/([^/]+)")
 SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -157,7 +158,6 @@ class CapturePage(Protocol):
         self, state: Literal["networkidle"] | None = ..., *, timeout: float | None = ...
     ) -> None: ...
     async def eval_on_selector_all(self, selector: str, expression: str) -> Any: ...
-    async def click(self, selector: str, *, timeout: float | None = ...) -> None: ...
 
 
 class CaptureContext(SessionContext, Protocol):
@@ -253,7 +253,11 @@ def _render(
         return f"{number:02d}-{_slug(urlsplit(safe_url).path)}.json", _dump(body)
     if record.flight is None:
         return None
-    slug = FLIGHT_SLUG if record.flight_kind == KIND_FLIGHT else _slug(urlsplit(safe_url).path)
+    path = urlsplit(safe_url).path
+    if record.flight_kind != KIND_FLIGHT:
+        slug = _slug(path)
+    else:
+        slug = FLIGHT_SLUG if path.rstrip("/") == LIBRARY_PATH else DETAIL_FLIGHT_SLUG
     return f"{number:02d}-{slug}.rsc.txt", sanitize_flight(record.flight, gamekey_map, pattern)
 
 
@@ -371,14 +375,14 @@ async def _wait_idle(page: CapturePage, timeout_ms: float) -> None:
 
 
 async def _open_detail(page: CapturePage, timeout_ms: float) -> None:
-    """Best-effort: click one safe library-item link so client-navigation RSC is captured."""
+    """Best-effort: open the first bundle's detail page (a read-only GET) and capture it."""
     try:
-        raw = cast("list[Any]", await page.eval_on_selector_all(LINK_SELECTOR, HREF_JS))
-        href = select_detail_href(item for item in raw if isinstance(item, str))
-        if href is None:
+        raw = cast("list[Any]", await page.eval_on_selector_all(SCRIPT_SELECTOR, SCRIPT_TEXT_JS))
+        bundle_id = select_bundle_id(item for item in raw if isinstance(item, str))
+        if bundle_id is None:
             _log.info("capture_no_detail_link")
             return
-        await page.click(f"{LINK_SELECTOR[:-1]}={json.dumps(href)}]", timeout=timeout_ms)
+        await page.goto(HUMBLE_BASE + library_detail_path(bundle_id), timeout=timeout_ms)
         await _wait_idle(page, timeout_ms)
     except PlaywrightError:
         _log.warning("capture_detail_navigation_failed")

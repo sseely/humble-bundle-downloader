@@ -142,15 +142,14 @@ class FakePage:
         responses: list[FakeResponse],
         goto_error: Exception | None = None,
         idle_error: Exception | None = None,
-        hrefs: list[Any] | None = None,
+        scripts: list[Any] | None = None,
         detail_responses: list[FakeResponse] | None = None,
-        click_error: Exception | None = None,
+        detail_error: Exception | None = None,
     ) -> None:
         self.mouse = FakeMouse()
-        self.hrefs = hrefs or []
+        self.scripts = scripts or []
         self.detail_responses = detail_responses or []
-        self.click_error = click_error
-        self.clicked: list[str] = []
+        self.detail_error = detail_error
         self.responses = responses
         self.goto_error = goto_error
         self.idle_error = idle_error
@@ -162,9 +161,11 @@ class FakePage:
 
     async def goto(self, url: str, *, timeout: float | None = None) -> object:
         self.visited.append(url)
-        if self.goto_error is not None:
-            raise self.goto_error
-        for response in self.responses:
+        first = len(self.visited) == 1
+        error = self.goto_error if first else self.detail_error
+        if error is not None:
+            raise error
+        for response in self.responses if first else self.detail_responses:
             for handler in self.handlers:
                 handler(response)
         return None
@@ -176,15 +177,7 @@ class FakePage:
             raise self.idle_error
 
     async def eval_on_selector_all(self, selector: str, expression: str) -> Any:
-        return self.hrefs
-
-    async def click(self, selector: str, *, timeout: float | None = None) -> None:
-        self.clicked.append(selector)
-        if self.click_error is not None:
-            raise self.click_error
-        for response in self.detail_responses:
-            for handler in self.handlers:
-                handler(response)
+        return self.scripts
 
 
 class FakeContext:
@@ -756,30 +749,34 @@ async def test_run_capture_skips_identity_when_session_expired(tmp_path: Path) -
     assert called == []
 
 
-async def test_run_capture_clicks_safe_detail_link_and_records_client_navigation(
+BUNDLE_ID = "c7a551c0-0000-4000-8000-00000000abcd"
+BUNDLE_SCRIPT = (
+    'self.__next_f.push([1,"11:{\\"productEntitlementId\\":\\"' + BUNDLE_ID + '\\"}\\n"])'
+)
+DETAIL_URL = f"{LIBRARY_URL}/{BUNDLE_ID}"
+
+
+async def test_run_capture_opens_first_bundle_detail_page_and_records_its_flight(
     tmp_path: Path,
 ) -> None:
-    detail = FakeResponse(
-        url=f"{HUMBLE_BASE}/downloads?key={KEY_A}&_rsc=z",
-        body=f'5:{{"gamekey":"{KEY_A}"}}\n',
-        headers=RSC_HEADERS,
-    )
-    hrefs = [None, 7, "/gift/claim/ClaimToken123", "/redeem", f"/downloads?key={KEY_A}"]
-    ctx = make_ctx(hrefs=hrefs, detail_responses=[detail])
+    detail = FakeResponse(url=DETAIL_URL, body=library_html(FLIGHT_TEXT), headers=HTML_HEADERS)
+    ctx = make_ctx(scripts=[None, 7, "var a = 1;", BUNDLE_SCRIPT], detail_responses=[detail])
     out_dir = tmp_path / "o"
 
     written = await capture_run(ctx, make_settings(tmp_path), out_dir, sleep=FakeSleep())
 
-    assert ctx.page.clicked == [f'a[href="/downloads?key={KEY_A}"]']
-    assert written[0].name == "01-downloads.rsc.txt"
-    assert written[0].read_text(encoding="utf-8") == '5:{"gamekey":"GAMEKEY_0001"}\n'
-    assert KEY_A not in all_output_text(out_dir)
+    assert ctx.page.visited == [LIBRARY_URL, DETAIL_URL]
+    assert written[0].name == "01-library-detail-flight.rsc.txt"
+    assert written[0].read_text(encoding="utf-8").startswith("0:")
+    assert "01-library-detail-flight.rsc.txt | flight |" in (out_dir / INDEX_NAME).read_text(
+        encoding="utf-8"
+    )
 
 
-async def test_run_capture_logs_when_no_detail_link(
+async def test_run_capture_logs_when_no_bundle_id(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    ctx = make_ctx(hrefs=["/gift/claim/Token12345", "/checkout"])
+    ctx = make_ctx(scripts=["var a = 1;", '"productEntitlementId":"nope"'])
 
     await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
 
@@ -789,16 +786,16 @@ async def test_run_capture_logs_when_no_detail_link(
         if line.startswith("{")
     ]
     assert "capture_no_detail_link" in messages
-    assert ctx.page.clicked == []
+    assert ctx.page.visited == [LIBRARY_URL]
 
 
-async def test_run_capture_continues_when_detail_click_fails(tmp_path: Path) -> None:
-    ctx = make_ctx(hrefs=["/downloads?key=AnyKey123456"], click_error=PlaywrightError("detached"))
+async def test_run_capture_continues_when_detail_navigation_fails(tmp_path: Path) -> None:
+    ctx = make_ctx(scripts=[BUNDLE_SCRIPT], detail_error=PlaywrightError("net::ERR_ABORTED"))
 
     written = await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
 
     assert [p.name for p in written] == [INDEX_NAME]
-    assert len(ctx.page.clicked) == 1
+    assert ctx.page.visited == [LIBRARY_URL, DETAIL_URL]
 
 
 async def test_run_capture_skips_oversized_body_and_empty_flight(tmp_path: Path) -> None:

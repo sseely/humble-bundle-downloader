@@ -1,4 +1,4 @@
-"""Tests for humble_dl.api.rsc (pure flight parsing and link selection)."""
+"""Tests for humble_dl.api.rsc (pure flight parsing and bundle selection)."""
 
 import json
 
@@ -14,12 +14,14 @@ from humble_dl.api.rsc import (
     classify_response,
     extract_flight_from_html,
     is_humble_host,
+    library_detail_path,
     parse_flight,
     render_flight,
-    select_detail_href,
+    select_bundle_id,
 )
 
 LIBRARY_URL = "https://www.humblebundle.com/home/library"
+BUNDLE_ID = "c7a551c0-0000-4000-8000-00000000abcd"
 
 
 def push(kind: int, text: str) -> str:
@@ -100,6 +102,8 @@ def test_render_flight_roundtrips_and_recomputes_text_length() -> None:
     [
         (LIBRARY_URL, "text/html; charset=utf-8", KIND_FLIGHT),
         (LIBRARY_URL + "/", "TEXT/HTML", KIND_FLIGHT),
+        (f"{LIBRARY_URL}/{BUNDLE_ID}", "text/html", KIND_FLIGHT),
+        ("https://www.humblebundle.com/home/libraryx", "text/html", None),
         ("https://www.humblebundle.com/other", "text/html", None),
         ("https://www.humblebundle.com/x", "application/json", KIND_JSON),
         ("https://www.humblebundle.com/x?_rsc=1", "text/x-component", KIND_RSC),
@@ -127,25 +131,25 @@ def test_is_humble_host(url: str, expected: bool) -> None:
     assert is_humble_host(url) is expected
 
 
-def test_select_detail_href_skips_claim_and_picks_downloads_link() -> None:
-    hrefs = [
-        "/",
-        "/gift/claim/AbCdEfGh123",
-        "/checkout/cart",
-        "/store/buy-now?key=zzzzzz",
-        "https://evil.example.com/downloads?key=abc",
-        "//evil.example.com/downloads",
-        "javascript:void(0)",
-        "/downloads?key=RealKey123456",
-        "/gift/SomeGift12345",
+def test_select_bundle_id_reads_escaped_inline_flight_text() -> None:
+    script = push(1, f'11:{{"productEntitlementId":"{BUNDLE_ID}","title":"T"}}\n')
+    texts = [
+        "",
+        "var x = 1;",
+        script,
+        'productEntitlementId":"c7a551c0-1111-4000-8000-000000000000"',
     ]
 
-    assert select_detail_href(hrefs) == "/downloads?key=RealKey123456"
+    assert select_bundle_id(texts) == BUNDLE_ID
 
 
-def test_select_detail_href_accepts_absolute_site_links_and_none_when_absent() -> None:
-    absolute = "https://www.humblebundle.com/gift/SomeGift12345"
+def test_select_bundle_id_accepts_unescaped_text_and_none_when_absent() -> None:
+    raw = f'{{"productEntitlementId":"{BUNDLE_ID.upper()}"}}'
 
-    assert select_detail_href(["/home/library", absolute]) == absolute
-    assert select_detail_href(["/home/library", "/redeem?key=1"]) is None
-    assert select_detail_href([]) is None
+    assert select_bundle_id([raw]) == BUNDLE_ID.upper()
+    assert select_bundle_id(['"productEntitlementId":"not-a-uuid"']) is None
+    assert select_bundle_id([]) is None
+
+
+def test_library_detail_path() -> None:
+    assert library_detail_path(BUNDLE_ID) == f"/home/library/{BUNDLE_ID}"

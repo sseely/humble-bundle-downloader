@@ -27,8 +27,12 @@ LIBRARY_PATH: Final = "/home/library"
 JSON_CONTENT_TYPE: Final = "json"
 RSC_CONTENT_TYPE: Final = "text/x-component"
 HTML_CONTENT_TYPE: Final = "text/html"
-DETAIL_MARKERS: Final = ("/downloads", "key=", "/gift/")
-DETAIL_BLOCKED: Final = ("checkout", "purchase", "buy", "redeem", "claim", "cart")
+# A bundle's productEntitlementId in flight text; inside an inline push() the
+# quotes are JS-escaped (\"), so backslashes before quotes are optional.
+BUNDLE_ID_RE: Final = re.compile(
+    r'productEntitlementId\\*":\\*"'
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
 HEX_BASE: Final = 16
 COMPACT_SEPARATORS: Final = (",", ":")
 ROW_START_RE = re.compile(r"[0-9a-fA-F]+:")
@@ -168,7 +172,7 @@ def render_flight(rows: Iterable[FlightRow]) -> str:
     return "".join(f"{_render_row(row)}\n" for row in rows)
 
 
-# --- response classification and detail-link choice (pure) -------------------
+# --- response classification and bundle choice (pure) ------------------------
 
 
 def is_humble_host(url: str) -> bool:
@@ -184,28 +188,27 @@ def classify_response(url: str, content_type: str) -> ResponseKind | None:
         return KIND_JSON
     if RSC_CONTENT_TYPE in lowered:
         return KIND_RSC
-    if HTML_CONTENT_TYPE in lowered and urlsplit(url).path.rstrip("/") == LIBRARY_PATH:
+    path = urlsplit(url).path.rstrip("/")
+    if HTML_CONTENT_TYPE in lowered and (
+        path == LIBRARY_PATH or path.startswith(LIBRARY_PATH + "/")
+    ):
         return KIND_FLIGHT
     return None
 
 
-def _is_site_href(href: str) -> bool:
-    if href.startswith("/"):
-        return not href.startswith("//")
-    return urlsplit(href).scheme in ("http", "https") and is_humble_host(href)
+def select_bundle_id(texts: Iterable[str]) -> str | None:
+    """Return the first bundle id (productEntitlementId UUID) found in ``texts``.
 
-
-def select_detail_href(hrefs: Iterable[str]) -> str | None:
-    """Pick the first library-item link, never one that could buy/gift/redeem/claim.
-
-    Only same-site hrefs containing ``/downloads``, ``key=`` or ``/gift/`` qualify;
-    any href containing a blocked word (checkout, purchase, buy, redeem, claim,
-    cart) is skipped.
+    ``texts`` are the library page's inline script bodies. Opening a bundle's
+    detail page is a read-only GET, unlike the old gift/claim links.
     """
-    for href in hrefs:
-        lowered = href.lower()
-        if not _is_site_href(href) or any(word in lowered for word in DETAIL_BLOCKED):
-            continue
-        if any(marker in lowered for marker in DETAIL_MARKERS):
-            return href
+    for text in texts:
+        match = BUNDLE_ID_RE.search(text)
+        if match is not None:
+            return match.group(1)
     return None
+
+
+def library_detail_path(bundle_id: str) -> str:
+    """Path of a bundle's detail page in the library."""
+    return f"{LIBRARY_PATH}/{bundle_id}"
