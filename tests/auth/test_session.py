@@ -400,12 +400,12 @@ class FakeBrowserContext:
 class FakeChromium:
     def __init__(self, context: FakeBrowserContext) -> None:
         self.context = context
-        self.launches: list[tuple[str, bool]] = []
+        self.launches: list[tuple[str, bool, str | None]] = []
 
     async def launch_persistent_context(
-        self, user_data_dir: str, *, headless: bool
+        self, user_data_dir: str, *, headless: bool, channel: str | None = None
     ) -> FakeBrowserContext:
-        self.launches.append((user_data_dir, headless))
+        self.launches.append((user_data_dir, headless, channel))
         return self.context
 
 
@@ -435,7 +435,9 @@ async def test_open_context_prepares_profile_launches_and_closes(
         assert context.closed is False
         assert stat.S_IMODE(settings.profile_dir.stat().st_mode) == 0o700
     assert context.closed is True
-    assert chromium.launches == [(str(settings.profile_dir), not headed)]
+    # Both modes must use the full Chromium binary: the default headless-shell
+    # binary cannot read the cookies headed Chromium persisted to the profile.
+    assert chromium.launches == [(str(settings.profile_dir), not headed, "chromium")]
 
 
 @pytest.mark.live

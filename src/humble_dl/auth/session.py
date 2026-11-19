@@ -37,6 +37,10 @@ EXPIRES_AT_KEY = "expires_at"
 HUMBLE_COOKIE_DOMAIN = "humblebundle.com"
 SESSION_COOKIE_EXPIRES = -1.0  # Playwright reports browser-session cookies as -1
 SESSION_COOKIE_FALLBACK_S = 24 * 60 * 60
+# Full Chromium in both modes. Without a channel, Playwright runs headless mode
+# on the separate chromium-headless-shell binary, which cannot read (and drops)
+# the encrypted cookies headed Chromium persisted, so capture saw no session.
+BROWSER_CHANNEL = "chromium"
 
 HTTP_OK = 200
 HTTP_UNAUTHORIZED = 401
@@ -171,7 +175,7 @@ async def open_context(settings: Settings, *, headed: bool) -> AsyncGenerator[Br
     prepare_profile_dir(settings.profile_dir)
     async with async_playwright() as playwright:
         context = await playwright.chromium.launch_persistent_context(
-            str(settings.profile_dir), headless=not headed
+            str(settings.profile_dir), headless=not headed, channel=BROWSER_CHANNEL
         )
         try:
             yield context
