@@ -1,5 +1,6 @@
 """Tests for humble_dl.api.capture using fake contexts (no real browser)."""
 
+import asyncio
 import dataclasses
 import functools
 import json
@@ -150,8 +151,10 @@ class FakePage:
         detail_error: Exception | None = None,
         click_responses: list[FakeResponse] | None = None,
         click_error: Exception | None = None,
+        evaluate_error: Exception | None = None,
     ) -> None:
         self.mouse = FakeMouse()
+        self.evaluate_error = evaluate_error
         self.scripts = scripts or []
         self.detail_responses = detail_responses or []
         self.detail_error = detail_error
@@ -165,6 +168,8 @@ class FakePage:
         self.evaluated: list[str] = []
         self.clicked: list[str] = []
         self.emitted: list[FakeResponse] = []
+        self.waited_events: list[str] = []
+        self._clicked = asyncio.Event()
 
     def on(self, event: Literal["response"], f: Callable[[Any], None]) -> None:
         self.handlers.append(f)
@@ -197,6 +202,8 @@ class FakePage:
 
     async def evaluate(self, expression: str) -> Any:
         self.evaluated.append(expression)
+        if self.evaluate_error is not None:
+            raise self.evaluate_error
         return None
 
     async def dispatch_event(
@@ -206,6 +213,22 @@ class FakePage:
         if self.click_error is not None:
             raise self.click_error
         self._emit(self.click_responses)
+        self._clicked.set()
+
+    async def wait_for_event(
+        self,
+        event: str,
+        predicate: Callable[[Any], bool] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        """Resolves with the first matching click response; times out if none match."""
+        self.waited_events.append(event)
+        await self._clicked.wait()
+        for response in self.click_responses:
+            if predicate is None or predicate(response):
+                return response
+        raise PlaywrightTimeoutError("Timeout 30000ms exceeded while waiting for event")
 
 
 class FakeContext:
@@ -853,6 +876,7 @@ async def test_run_capture_requests_signed_urls_with_window_open_disabled(tmp_pa
 
     assert ctx.page.evaluated == [DISABLE_WINDOW_OPEN_JS]
     assert ctx.page.clicked == [f"click:{FORMAT_BUTTON_SELECTOR}"]
+    assert ctx.page.waited_events == ["response"]
     text = written[0].read_text(encoding="utf-8")
     assert '"web":"https://cdn.x.net/REDACTED/k.epub"' in text
     assert "TOKEN9SECRET" not in all_output_text(out_dir)
@@ -875,6 +899,41 @@ async def test_run_capture_logs_and_continues_when_format_click_fails(
     ]
     failed = [entry for entry in logs if entry["msg"] == "capture_format_click_failed"]
     assert [entry["reason"] for entry in failed] == ["none"]
+
+
+@pytest.mark.parametrize(
+    ("evaluate_error", "click_error"),
+    [
+        (PlaywrightError("Target closed"), None),
+        (None, PlaywrightTimeoutError("Timeout 30000ms exceeded")),
+    ],
+)
+async def test_run_capture_reports_click_step_failures_as_click_failed(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    evaluate_error: Exception | None,
+    click_error: Exception | None,
+) -> None:
+    ctx = make_ctx(scripts=[BUNDLE_SCRIPT], evaluate_error=evaluate_error, click_error=click_error)
+
+    await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
+
+    err = capsys.readouterr().err
+    assert "capture_format_click_failed" in err
+    assert "capture_signed_url_response_missing" not in err
+
+
+async def test_run_capture_logs_when_click_brings_no_post_response(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    detail = FakeResponse(url=DETAIL_URL, body=library_html(FLIGHT_TEXT), headers=HTML_HEADERS)
+    stray_get = FakeResponse(url=f"{HUMBLE_BASE}/x?_rsc=1", body='0:"x"\n', headers=RSC_HEADERS)
+    ctx = make_ctx(scripts=[BUNDLE_SCRIPT], detail_responses=[detail], click_responses=[stray_get])
+
+    written = await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
+
+    assert written[0].name == "01-library-detail-flight.rsc.txt"
+    assert "capture_signed_url_response_missing" in capsys.readouterr().err
 
 
 async def test_run_capture_skips_oversized_body_and_empty_flight(tmp_path: Path) -> None:
