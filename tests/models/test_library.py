@@ -278,6 +278,33 @@ def test_apply_signed_urls_swaps_and_reports_missing() -> None:
     assert len(original.subproducts[0].downloads[0].files) == 2
 
 
+def test_apply_signed_urls_ignores_non_ebook_downloads() -> None:
+    # Live 2026-11-19: one bundle's audiobooks (*-mp3.zip / *-flac.zip) are
+    # never signed (ebooks only) and must not be reported as missing.
+    ebook = FileVersion(label="EPUB", url="book.epub", md5=None, file_size=None)
+    audio = FileVersion(label="MP3", url="book-mp3.zip", md5=None, file_size=None)
+    order = Order(
+        gamekey="g",
+        human_name="h",
+        subproducts=[
+            Subproduct(
+                machine_name="book",
+                human_name="Book",
+                downloads=[
+                    Download(platform=EBOOK_PLATFORM, key="book_ebook", files=[ebook]),
+                    Download(platform="audio", key="book_audio", files=[audio]),
+                ],
+            )
+        ],
+    )
+
+    result, missing = apply_signed_urls(order, {"book_ebook": {"book.epub": "https://s/book.epub"}})
+
+    assert missing == []
+    assert [d.platform for d in result.subproducts[0].downloads] == [EBOOK_PLATFORM]
+    assert result.subproducts[0].downloads[0].files[0].url == "https://s/book.epub"
+
+
 def test_apply_signed_urls_on_real_fixtures() -> None:
     order = parse_bundle(read_fixture("bundle.rsc.txt"), FIRST_BUNDLE_ID)
 

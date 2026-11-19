@@ -451,8 +451,10 @@ def apply_signed_urls(
         signed: ``{download_key: {filename: signed_url}}``.
 
     Returns:
-        A new order (input untouched) and the filenames with no signed URL,
-        which are dropped from it.
+        A new order (input untouched) and the ebook filenames with no signed
+        URL, which are dropped from it. Non-ebook downloads (e.g. audiobooks)
+        are out of scope: they are never signed, so they are dropped without
+        being reported.
     """
     missing: list[str] = []
     subproducts = [
@@ -461,6 +463,7 @@ def apply_signed_urls(
                 "downloads": [
                     d.model_copy(update={"files": _signed_files(d, signed, missing)})
                     for d in sub.downloads
+                    if d.platform == EBOOK_PLATFORM
                 ]
             }
         )
