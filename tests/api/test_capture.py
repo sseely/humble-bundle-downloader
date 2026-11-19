@@ -199,8 +199,10 @@ class FakePage:
         self.evaluated.append(expression)
         return None
 
-    async def click(self, selector: str, *, timeout: float | None = None) -> None:
-        self.clicked.append(selector)
+    async def dispatch_event(
+        self, selector: str, type: str, *, timeout: float | None = None
+    ) -> None:
+        self.clicked.append(f"{type}:{selector}")
         if self.click_error is not None:
             raise self.click_error
         self._emit(self.click_responses)
@@ -850,7 +852,7 @@ async def test_run_capture_requests_signed_urls_with_window_open_disabled(tmp_pa
     written = await capture_run(ctx, make_settings(tmp_path), out_dir, sleep=FakeSleep())
 
     assert ctx.page.evaluated == [DISABLE_WINDOW_OPEN_JS]
-    assert ctx.page.clicked == [FORMAT_BUTTON_SELECTOR]
+    assert ctx.page.clicked == [f"click:{FORMAT_BUTTON_SELECTOR}"]
     text = written[0].read_text(encoding="utf-8")
     assert '"web":"https://cdn.x.net/REDACTED/k.epub"' in text
     assert "TOKEN9SECRET" not in all_output_text(out_dir)
@@ -868,7 +870,11 @@ async def test_run_capture_logs_and_continues_when_format_click_fails(
     written = await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
 
     assert written[0].name == "01-library-detail-flight.rsc.txt"
-    assert "capture_format_click_failed" in capsys.readouterr().err
+    logs = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines() if line.startswith("{")
+    ]
+    failed = [entry for entry in logs if entry["msg"] == "capture_format_click_failed"]
+    assert [entry["reason"] for entry in failed] == ["none"]
 
 
 async def test_run_capture_skips_oversized_body_and_empty_flight(tmp_path: Path) -> None:

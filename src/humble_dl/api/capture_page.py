@@ -20,8 +20,10 @@ SCROLL_STEPS = 3
 SCROLL_DELTA_PX = 2000
 SCRIPT_SELECTOR = "script"
 SCRIPT_TEXT_JS = "els => els.map(e => e.textContent)"
-# Format buttons read like "EPUB (2.9 MB)"; no backslashes, so no selector escaping.
-FORMAT_BUTTON_SELECTOR = 'button:text-matches("[(][0-9.]+ (bytes|KB|MB|GB|TB)[)]")'
+# Format buttons' text reads like "EPUB(2.9 MB)". Plain substring matching: a
+# :text-matches() regex selector matched nothing on the live page.
+FORMAT_BUTTON_SELECTOR = 'button:has-text(" KB)"), button:has-text(" MB)"), button:has-text(" GB)")'
+CLICK_EVENT = "click"
 DISABLE_WINDOW_OPEN_JS = "() => { window.open = () => null; }"
 
 _log = get_logger(__name__)
@@ -67,7 +69,9 @@ class CapturePage(Protocol):
     ) -> None: ...
     async def eval_on_selector_all(self, selector: str, expression: str) -> Any: ...
     async def evaluate(self, expression: str) -> Any: ...
-    async def click(self, selector: str, *, timeout: float | None = ...) -> None: ...
+    async def dispatch_event(
+        self, selector: str, type: str, *, timeout: float | None = ...
+    ) -> None: ...
 
 
 class ResponseCollector:
@@ -129,11 +133,16 @@ async def open_bundle(page: CapturePage, bundle_id: str, timeout_ms: float) -> b
 
 
 async def request_signed_urls(page: CapturePage, timeout_ms: float) -> None:
-    """Best-effort: click one format button with ``window.open`` disabled."""
+    """Best-effort: click one format button with ``window.open`` disabled.
+
+    The click is dispatched to the element, so a consent banner covering the
+    page cannot intercept it and no consent choice is made on the user's behalf.
+    """
     try:
         await page.evaluate(DISABLE_WINDOW_OPEN_JS)
-        await page.click(FORMAT_BUTTON_SELECTOR, timeout=timeout_ms)
-    except PlaywrightError:
-        _log.warning("capture_format_click_failed")
+        await page.dispatch_event(FORMAT_BUTTON_SELECTOR, CLICK_EVENT, timeout=timeout_ms)
+    except PlaywrightError as exc:
+        reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        _log.warning("capture_format_click_failed", extra={"reason": reason})
         return
     await wait_idle(page, timeout_ms)
