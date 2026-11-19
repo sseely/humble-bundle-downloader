@@ -66,3 +66,9 @@
 - **Finding**: The list page's RSC flight data carries `bundleItems[]` (id = productEntitlementId UUID, title, `type: "bundle"`, `itemType: "content-entitlement"`, `entitlements.downloads[]`) with per-file `downloads` and `signedUrls` set to `"$undefined"`. Each bundle's books and format download buttons (e.g. "EPUB (2.9 MB)", format selector, Bulk Download) are on `/home/library/<productEntitlementId>`. Rows are not `<a href>` links. The page also has "Purchased" and "Bundles" tabs. Two Next.js server-action POSTs to `/home/library` returned 403 under capture.
 - **Impact**: The library client must enumerate bundle ids from the list page, then read each detail page. A "still migrating" banner on the page does not mean files are missing.
 - **Confidence**: High (capture + human screenshots)
+
+## Observation: Cloudflare blocks server-action POSTs from headless Chromium (2026-11-19)
+- **Context**: Capturing the signed-URL request on `/home/library/<bundle id>`.
+- **Finding**: Next.js server-action POSTs (`Next-Action` header) from headless Chromium get 403 with Cloudflare's "Attention Required!" page; the same requests from headed Chromium get 200. Page GETs succeed headless. The only differing request header seen was the UA (`HeadlessChrome/...` vs `Chrome/...`). `getSignedUrlsForEntitlements([entitlementId])` returns `data.signedUrls[subproductMachineName][downloadKey][filename] = "https://cdn.humble.com/humblebundle/<filename>?<signature>"`. Action ids are per-deploy (`70f766da...` getSignedUrls, `40528d76...` recordDownload at time of writing).
+- **Impact**: Signed URLs require a headed browser (or a non-headless fingerprint). Files are served from `cdn.humble.com`, not `dl.humble.com`.
+- **Confidence**: High (back-to-back headless/headed runs, same profile)
