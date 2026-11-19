@@ -54,3 +54,9 @@
   Kratos session `expires_at` before closing the context, or every later
   command is logged out.
 - **Confidence**: High
+
+## Observation: Playwright headless-shell cannot read a headed profile's cookies
+- **Context**: `humble-dl login` (headed) persisted the Ory session; `capture` (headless) got whoami 401.
+- **Finding**: Playwright 1.65 runs `headless=True` without a channel on the separate `chromium-headless-shell` binary (driver coreBundle.js `getExecutableName`). It loaded none of the encrypted (v11) cookies headed Chromium wrote, and a later headed run also saw none, consistent with the shell discarding them. `channel="chromium"` (same binary, new headless) loads them and whoami returns 200.
+- **Impact**: Any persistent-profile context shared between headed and headless runs must pass `channel="chromium"`.
+- **Confidence**: High (controlled back-to-back experiment on the same profile)
