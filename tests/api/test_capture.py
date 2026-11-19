@@ -1,8 +1,9 @@
 """Tests for humble_dl.api.capture using fake contexts (no real browser)."""
 
 import dataclasses
+import functools
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -16,22 +17,26 @@ from humble_dl.api import capture
 from humble_dl.api.capture import (
     EMAIL_PLACEHOLDER,
     INDEX_NAME,
+    MAX_BODY_CHARS,
     MAX_ORDERS,
     MAX_PAGE_RESPONSES,
     CaptureContext,
     CaptureError,
     CaptureLeakError,
     Record,
-    assert_clean,
     build_outputs,
-    is_humble_host,
-    list_gamekeys,
     run_capture,
-    sanitize,
 )
-from humble_dl.auth.session import HUMBLE_BASE, BotChallengeError, SessionExpiredError
+from humble_dl.auth.session import (
+    HUMBLE_BASE,
+    BotChallengeError,
+    SessionContext,
+    SessionExpiredError,
+)
 from humble_dl.config import Settings
 
+RSC_HEADERS = {"content-type": "text/x-component"}
+HTML_HEADERS = {"content-type": "text/html; charset=utf-8"}
 JSON_HEADERS = {"content-type": "application/json; charset=utf-8"}
 TEXT_HEADERS = {"content-type": "text/plain"}
 USER_ORDER_URL = f"{HUMBLE_BASE}/api/v1/user/order"
@@ -39,6 +44,8 @@ KEY_A = "AbC123xyZ789"
 KEY_B = "QwErTy456uIoP"
 EMAIL = "reader@example.com"
 HEADER_LEAK = "HEADER-SECRET-VALUE"
+LIBRARY_URL = f"{HUMBLE_BASE}/home/library"
+DL_URL = "https://dl.humble.com/book.pdf?ttl=1700000000&t=SIGNEDVALUE"
 HTTP_OK = 200
 HTTP_NOT_FOUND = 404
 HTTP_UNAUTHORIZED = 401
@@ -76,10 +83,16 @@ class FakeResponse:
     body: str = "{}"
     headers: dict[str, str] = field(default_factory=lambda: dict(JSON_HEADERS))
     text_error: Exception | None = None
+    json_error: Exception | None = None
 
     @property
     def request(self) -> FakeRequest:
         return FakeRequest(self.method)
+
+    async def json(self) -> Any:
+        if self.json_error is not None:
+            raise self.json_error
+        return json.loads(self.body)
 
     async def text(self) -> str:
         if self.text_error is not None:
@@ -129,8 +142,15 @@ class FakePage:
         responses: list[FakeResponse],
         goto_error: Exception | None = None,
         idle_error: Exception | None = None,
+        hrefs: list[Any] | None = None,
+        detail_responses: list[FakeResponse] | None = None,
+        click_error: Exception | None = None,
     ) -> None:
         self.mouse = FakeMouse()
+        self.hrefs = hrefs or []
+        self.detail_responses = detail_responses or []
+        self.click_error = click_error
+        self.clicked: list[str] = []
         self.responses = responses
         self.goto_error = goto_error
         self.idle_error = idle_error
@@ -155,11 +175,31 @@ class FakePage:
         if self.idle_error is not None:
             raise self.idle_error
 
+    async def eval_on_selector_all(self, selector: str, expression: str) -> Any:
+        return self.hrefs
+
+    async def click(self, selector: str, *, timeout: float | None = None) -> None:
+        self.clicked.append(selector)
+        if self.click_error is not None:
+            raise self.click_error
+        for response in self.detail_responses:
+            for handler in self.handlers:
+                handler(response)
+
 
 class FakeContext:
-    def __init__(self, page: FakePage, request: FakeRequester) -> None:
+    def __init__(
+        self,
+        page: FakePage,
+        request: FakeRequester,
+        cookies: list[dict[str, object]] | None = None,
+    ) -> None:
         self.page = page
         self.request = request
+        self._cookies = cookies or []
+
+    async def cookies(self) -> Sequence[Mapping[str, object]]:
+        return self._cookies
 
     async def new_page(self) -> FakePage:
         return self.page
@@ -181,9 +221,21 @@ def real_context_satisfies_protocol(ctx: BrowserContext) -> CaptureContext:
 def make_ctx(
     page_responses: list[FakeResponse] | None = None,
     requester: FakeRequester | None = None,
+    cookies: list[dict[str, object]] | None = None,
     **page_kwargs: Any,
 ) -> FakeContext:
-    return FakeContext(FakePage(page_responses or [], **page_kwargs), requester or FakeRequester())
+    page = FakePage(page_responses or [], **page_kwargs)
+    return FakeContext(page, requester or FakeRequester(), cookies)
+
+
+def identity_of(*values: str) -> Callable[[SessionContext, Settings], Awaitable[list[str]]]:
+    async def fetch(ctx: SessionContext, settings: Settings) -> list[str]:
+        return list(values)
+
+    return fetch
+
+
+capture_run = functools.partial(run_capture, fetch_identity=identity_of())
 
 
 def read_json(path: Path) -> Any:
@@ -192,131 +244,6 @@ def read_json(path: Path) -> Any:
 
 def all_output_text(out_dir: Path) -> str:
     return "\n".join(p.name + "\n" + p.read_text(encoding="utf-8") for p in out_dir.iterdir())
-
-
-# --- sanitize ----------------------------------------------------------------
-
-
-def test_sanitize_acceptance_payload() -> None:
-    payload = {
-        "orders": [{"gamekey": "AbC123", "dl": "https://dl.humble.com/f.pdf?gamekey=AbC123&t=x"}],
-        "email": "a@b.com",
-        "note": "contact a@b.com today",
-    }
-    gamekey_map: dict[str, str] = {}
-
-    result = sanitize(payload, gamekey_map)
-
-    assert gamekey_map == {"AbC123": "GAMEKEY_0001"}
-    assert result == {
-        "orders": [{"gamekey": "GAMEKEY_0001", "dl": "https://dl.humble.com/f.pdf"}],
-        "note": f"contact {EMAIL_PLACEHOLDER} today",
-    }
-    dumped = json.dumps(result)
-    for leaked in ("AbC123", "t=x", "a@b.com"):
-        assert leaked not in dumped
-
-
-def test_sanitize_shared_map_is_stable_across_payloads() -> None:
-    gamekey_map: dict[str, str] = {}
-
-    first = sanitize({"gamekey": "K1"}, gamekey_map)
-    second = sanitize([{"gamekey": "K2"}, {"gamekey": "K1"}], gamekey_map)
-
-    assert first == {"gamekey": "GAMEKEY_0001"}
-    assert second == [{"gamekey": "GAMEKEY_0002"}, {"gamekey": "GAMEKEY_0001"}]
-
-
-def test_sanitize_remaps_gamekey_in_url_path_and_dict_keys() -> None:
-    gamekey_map = {"PathKey99": "GAMEKEY_0001"}
-
-    result = sanitize(
-        {"PathKey99": "https://www.humblebundle.com/api/v1/order/PathKey99?x=1"}, gamekey_map
-    )
-
-    assert result == {"GAMEKEY_0001": "https://www.humblebundle.com/api/v1/order/GAMEKEY_0001"}
-
-
-@pytest.mark.parametrize(
-    "key",
-    ["Email", "X-CSRF-Token", "session_id", "api_key", "Cookie", "UID", "user_id", "ip", "card"]
-    + ["Authorization", "auth", "billing", "payment", "phone", "address", "password_hash"]
-    + ["username", "full_name", "First_Name", "last_name", "display_name"],
-)
-def test_sanitize_drops_secret_keys(key: str) -> None:
-    assert sanitize({key: "v", "name": "keep"}, {}) == {"name": "keep"}
-
-
-def test_sanitize_keeps_fields_needed_downstream() -> None:
-    payload: dict[str, Any] = {
-        "name": "n",
-        "human_name": "h",
-        "machine_name": "m",
-        "url": {"web": "https://dl.humble.com/a.pdf?token=zzz"},
-        "md5": "d41d8cd98f00b204e9800998ecf8427e",
-        "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
-        "file_size": 12,
-        "platform": "ebook",
-        "download_struct": [],
-    }
-
-    result = sanitize(payload, {})
-
-    assert result == {**payload, "url": {"web": "https://dl.humble.com/a.pdf"}}
-
-
-def test_sanitize_drops_non_string_gamekey_and_passes_scalars() -> None:
-    assert sanitize({"gamekey": 5, "n": 1, "f": 1.5, "b": True, "z": None}, {}) == {
-        "n": 1,
-        "f": 1.5,
-        "b": True,
-        "z": None,
-    }
-
-
-def test_sanitize_replaces_longest_gamekey_first() -> None:
-    gamekey_map = {"abc": "GAMEKEY_0001", "abcdef": "GAMEKEY_0002"}
-
-    assert sanitize("x abcdef y", gamekey_map) == "x GAMEKEY_0002 y"
-
-
-# --- assert_clean / helpers ---------------------------------------------------
-
-
-def test_assert_clean_passes_when_no_secret_present() -> None:
-    assert_clean("GAMEKEY_0001 user@example.invalid", [KEY_A, EMAIL, ""])
-
-
-@pytest.mark.parametrize("text", [f"x {KEY_A} y", f"x {KEY_A.lower()} y", f"mail {EMAIL.upper()}"])
-def test_assert_clean_raises_without_echoing_secret(text: str) -> None:
-    with pytest.raises(CaptureLeakError) as info:
-        assert_clean(text, [KEY_A, EMAIL])
-
-    assert KEY_A not in str(info.value)
-    assert EMAIL not in str(info.value)
-
-
-@pytest.mark.parametrize(
-    ("url", "expected"),
-    [
-        ("https://www.humblebundle.com/x", True),
-        ("https://humblebundle.com/x", True),
-        ("https://dl.humblebundle.com/x", True),
-        ("https://evilhumblebundle.com/x", False),
-        ("https://humblebundle.com.evil.net/x", False),
-        ("https://cdn.example.com/x", False),
-        ("not a url", False),
-    ],
-)
-def test_is_humble_host(url: str, expected: bool) -> None:
-    assert is_humble_host(url) is expected
-
-
-def test_list_gamekeys_handles_strings_dicts_and_junk() -> None:
-    body = ["StrKey1", {"gamekey": "DictKey2"}, {"other": 1}, 5, "", {"gamekey": 7}]
-
-    assert list_gamekeys(body) == ["StrKey1", "DictKey2"]
-    assert list_gamekeys({"gamekey": "x"}) == []
 
 
 # --- build_outputs -------------------------------------------------------------
@@ -413,16 +340,6 @@ def test_build_outputs_remaps_case_variants_to_same_fake() -> None:
     }
 
 
-def test_sanitize_prefix_key_cannot_partially_replace_longer_key() -> None:
-    gamekey_map = {"abc": "GAMEKEY_0001", "ABCdef": "GAMEKEY_0002"}
-
-    assert sanitize("abcDEF abc", gamekey_map) == "GAMEKEY_0002 GAMEKEY_0001"
-
-
-def test_sanitize_escapes_regex_metacharacters_in_keys() -> None:
-    assert sanitize("a+b a.b", {"a+b": "GAMEKEY_0001"}) == "GAMEKEY_0001 a.b"
-
-
 # --- run_capture ---------------------------------------------------------------
 
 
@@ -444,7 +361,7 @@ async def test_run_capture_writes_sanitized_fixtures_and_index(tmp_path: Path) -
     ]
     ctx = make_ctx(page_responses, FakeRequester())
 
-    written = await run_capture(ctx, make_settings(tmp_path), out_dir, sleep=FakeSleep())
+    written = await capture_run(ctx, make_settings(tmp_path), out_dir, sleep=FakeSleep())
 
     names = [p.name for p in written]
     assert names == [
@@ -458,8 +375,10 @@ async def test_run_capture_writes_sanitized_fixtures_and_index(tmp_path: Path) -
         "product": {"human_name": "B"},
     }
     index = (out_dir / INDEX_NAME).read_text(encoding="utf-8")
-    assert f"| 01 | GET | 200 | `{USER_ORDER_URL}` | 01-api-v1-user-order.json |" in index
-    assert "| 03 | GET | 200 | `https://www.humblebundle.com/styles.css` | - |" in index
+    assert f"| 01 | GET | 200 | `{USER_ORDER_URL}` | 01-api-v1-user-order.json | json |" in index
+    assert (
+        "| 03 | GET | 200 | `https://www.humblebundle.com/styles.css` | - | index-only |" in index
+    )
     assert "| 04 | GET | 404 |" in index
     assert "cdn.example.com" not in index
     dumped = all_output_text(out_dir)
@@ -477,7 +396,7 @@ async def test_run_capture_legacy_calls_are_capped_and_rate_limited(tmp_path: Pa
     sleep = FakeSleep()
     out_dir = tmp_path / "fixtures"
 
-    written = await run_capture(
+    written = await capture_run(
         make_ctx(requester=requester), make_settings(tmp_path), out_dir, sleep=sleep
     )
 
@@ -492,7 +411,7 @@ async def test_run_capture_skips_orders_when_user_order_not_json(tmp_path: Path)
     requester = FakeRequester()
     sleep = FakeSleep()
 
-    written = await run_capture(
+    written = await capture_run(
         make_ctx(requester=requester), make_settings(tmp_path), tmp_path / "o", sleep=sleep
     )
 
@@ -507,7 +426,7 @@ async def test_run_capture_stops_recording_after_page_cap(tmp_path: Path) -> Non
         json_response(f"{HUMBLE_BASE}/api/v1/n{i}", {"i": i}) for i in range(MAX_PAGE_RESPONSES + 5)
     ]
 
-    written = await run_capture(
+    written = await capture_run(
         make_ctx(responses), make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep()
     )
 
@@ -521,7 +440,7 @@ async def test_run_capture_unreadable_or_invalid_bodies_are_index_only(tmp_path:
         FakeResponse(url=f"{HUMBLE_BASE}/b", body="{not json"),
     ]
 
-    written = await run_capture(
+    written = await capture_run(
         make_ctx(responses), make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep()
     )
 
@@ -536,7 +455,7 @@ async def test_run_capture_tolerates_network_idle_timeout(tmp_path: Path) -> Non
         [json_response(f"{HUMBLE_BASE}/a", {"a": 1})], idle_error=PlaywrightTimeoutError("idle")
     )
 
-    written = await run_capture(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
+    written = await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
 
     assert [p.name for p in written] == ["01-a.json", INDEX_NAME]
 
@@ -546,7 +465,7 @@ async def test_run_capture_logs_redacted_paths_only(
 ) -> None:
     ctx = make_ctx([json_response(order_url(KEY_A), {"gamekey": KEY_A})])
 
-    await run_capture(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
+    await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
 
     lines = [
         json.loads(line) for line in capsys.readouterr().err.splitlines() if line.startswith("{")
@@ -574,7 +493,7 @@ async def test_run_capture_propagates_session_errors_and_writes_nothing(
     out_dir = tmp_path / "o"
 
     with pytest.raises(error):
-        await run_capture(ctx, make_settings(tmp_path), out_dir, sleep=FakeSleep())
+        await capture_run(ctx, make_settings(tmp_path), out_dir, sleep=FakeSleep())
 
     assert not out_dir.exists()
     assert ctx.page.visited == []
@@ -589,7 +508,7 @@ async def test_run_capture_wraps_browser_errors(tmp_path: Path, failure: str) ->
     out_dir = tmp_path / "o"
 
     with pytest.raises(CaptureError):
-        await run_capture(
+        await capture_run(
             make_ctx(requester=requester, goto_error=goto_error),
             make_settings(tmp_path),
             out_dir,
@@ -612,7 +531,7 @@ async def test_run_capture_writes_nothing_when_leak_detected(
     out_dir = tmp_path / "o"
 
     with pytest.raises(CaptureLeakError):
-        await run_capture(ctx, make_settings(tmp_path), out_dir, sleep=FakeSleep())
+        await capture_run(ctx, make_settings(tmp_path), out_dir, sleep=FakeSleep())
 
     assert not out_dir.exists()
 
@@ -625,8 +544,274 @@ async def test_run_capture_legacy_interval_derives_from_api_rps(
     sleep = FakeSleep()
     settings = dataclasses.replace(make_settings(tmp_path), api_rps=rps)
 
-    await run_capture(
+    await capture_run(
         make_ctx(requester=FakeRequester(routes)), settings, tmp_path / "o", sleep=sleep
     )
 
     assert sleep.calls == [expected]
+
+
+# --- flight / rsc / identity / cookies ---------------------------------------------
+
+REGEX_KEY = "RegexOnlyKey42"
+FLIGHT_TEXT = (
+    f'0:{{"dl":"{DL_URL}","email":"{EMAIL}","owner":"Hi Jane Doe","gamekey":"{KEY_A}"}}\n'
+    f'1:I raw jane DOE row {{"gamekey":"{REGEX_KEY}"}}\n'
+)
+
+
+def library_html(flight: str) -> str:
+    pushes = "".join(
+        f"<script>self.__next_f.push([1,{json.dumps(chunk)}])</script>"
+        for chunk in (flight[:10], flight[10:])
+    )
+    return f"<html><body><h1>RAW-HTML-MARKER</h1>{pushes}</body></html>"
+
+
+def flight_record(url: str, flight: str, kind: str = "rsc") -> Record:
+    return Record(url, "GET", HTTP_OK, False, None, flight=flight, flight_kind=kind)
+
+
+def test_build_outputs_sanitizes_flight_records_and_names_them() -> None:
+    records = [
+        flight_record(f"{HUMBLE_BASE}/x/Jane Doe?_rsc=1", FLIGHT_TEXT),
+        flight_record(LIBRARY_URL, FLIGHT_TEXT, "flight"),
+    ]
+
+    files = build_outputs(records, identity=["Jane Doe"])
+
+    assert list(files) == ["01-x-redacted.rsc.txt", "02-library-flight.rsc.txt", INDEX_NAME]
+    out = files["02-library-flight.rsc.txt"]
+    assert out.splitlines() == [
+        '0:{"dl":"https://dl.humble.com/book.pdf","owner":"Hi REDACTED","gamekey":"GAMEKEY_0001"}',
+        '1:I raw REDACTED row {"gamekey":"GAMEKEY_0002"}',
+    ]
+    everything = "\n".join(files.values())
+    for leaked in (KEY_A, REGEX_KEY, EMAIL, "SIGNEDVALUE", "ttl=", "jane"):
+        assert leaked.lower() not in everything.lower()
+    assert "| 01 | GET | 200 | `https://www.humblebundle.com/x/REDACTED` |" in files[INDEX_NAME]
+    assert "01-x-redacted.rsc.txt | rsc |" in files[INDEX_NAME]
+    assert "02-library-flight.rsc.txt | flight |" in files[INDEX_NAME]
+
+
+def test_build_outputs_collects_gamekeys_from_urls_before_queries_are_stripped() -> None:
+    records = [
+        rec(f"{HUMBLE_BASE}/downloads?key=UrlQueryKey99", {"link": "/gift/GiftPathKey77"}),
+        flight_record(f"{HUMBLE_BASE}/a", 'a:"see /gift/claim/x and /downloads?key=UrlQueryKey99"'),
+    ]
+
+    files = build_outputs(records)
+
+    everything = "\n".join(files.values())
+    assert "UrlQueryKey99" not in everything
+    assert "GiftPathKey77" not in everything
+    assert "/gift/claim/x" in files["02-a.rsc.txt"]
+
+
+def test_build_outputs_cookie_value_in_output_is_a_leak() -> None:
+    records = [flight_record(f"{HUMBLE_BASE}/a", '1:"cookie-value-12345"')]
+
+    with pytest.raises(CaptureLeakError) as info:
+        build_outputs(records, extra_secrets=["COOKIE-value-12345"])
+
+    assert "cookie-value" not in str(info.value)
+
+
+def test_build_outputs_identity_in_a_dumped_json_file_is_redacted() -> None:
+    files = build_outputs([rec(f"{HUMBLE_BASE}/me", {"greet": "hello JANE doe"})], ["Jane Doe"])
+
+    assert json.loads(files["01-me.json"]) == {"greet": "hello REDACTED"}
+
+
+def test_build_outputs_marks_oversized_bodies_in_index() -> None:
+    big = Record(f"{HUMBLE_BASE}/big", "GET", HTTP_OK, False, None, note="too large")
+
+    files = build_outputs([big])
+
+    assert files[INDEX_NAME].endswith(
+        "| `https://www.humblebundle.com/big` | - (too large) | index-only |\n"
+    )
+
+
+def test_record_kind_values() -> None:
+    assert rec(f"{HUMBLE_BASE}/").kind == "json"
+    assert flight_record(f"{HUMBLE_BASE}/", "0:1", "flight").kind == "flight"
+    assert rec(f"{HUMBLE_BASE}/", has_json=False).kind == "index-only"
+
+
+def test_capture_reexports_sanitizer_public_names() -> None:
+    from humble_dl.api import sanitize as sanitize_module
+
+    assert capture.sanitize is sanitize_module.sanitize
+    assert capture.CaptureLeakError is sanitize_module.CaptureLeakError
+    assert capture.SECRET_KEYS is sanitize_module.SECRET_KEYS
+
+
+def test_loggable_path_redacts_gift_gamekeys() -> None:
+    logged = capture._loggable_path(f"{HUMBLE_BASE}/gift/{KEY_A}?x=1")  # pyright: ignore[reportPrivateUsage]
+
+    assert logged == "/gift/AbC1…"
+
+
+async def test_run_capture_records_json_rsc_and_library_document(tmp_path: Path) -> None:
+    out_dir = tmp_path / "fixtures"
+    responses = [
+        FakeResponse(url=f"{HUMBLE_BASE}/api/x", body=json.dumps({"ok": 1})),
+        FakeResponse(
+            url=f"{HUMBLE_BASE}/home/library?_rsc=abc",
+            body=FLIGHT_TEXT,
+            headers=RSC_HEADERS,
+        ),
+        FakeResponse(url=LIBRARY_URL, body=library_html(FLIGHT_TEXT), headers=HTML_HEADERS),
+        FakeResponse(url=f"{HUMBLE_BASE}/other", body="<html>other</html>", headers=HTML_HEADERS),
+    ]
+    ctx = make_ctx(responses, cookies=[{"name": "s", "value": "short"}])
+    fetch = identity_of("Jane Doe", "ab")
+
+    written = await run_capture(ctx, make_settings(tmp_path), out_dir, fetch_identity=fetch)
+
+    names = [p.name for p in written]
+    assert (
+        names
+        == [
+            "01-api-x.json",
+            "02-home-library.rsc.txt",
+            "03-library-flight.rsc.txt",
+            INDEX_NAME,
+        ][:3]
+        + [INDEX_NAME]
+        or True
+    )
+    assert names == [
+        "01-api-x.json",
+        "02-home-library.rsc.txt",
+        "03-library-flight.rsc.txt",
+        INDEX_NAME,
+    ]
+    index = (out_dir / INDEX_NAME).read_text(encoding="utf-8")
+    assert "01-api-x.json | json |" in index
+    assert "02-home-library.rsc.txt | rsc |" in index
+    assert "03-library-flight.rsc.txt | flight |" in index
+    assert "| 04 | GET | 200 | `https://www.humblebundle.com/other` | - | index-only |" in index
+    flight_out = (out_dir / names[2]).read_text(encoding="utf-8")
+    assert flight_out == (out_dir / names[1]).read_text(encoding="utf-8")
+    assert "RAW-HTML-MARKER" not in all_output_text(out_dir)
+    assert "Jane" not in all_output_text(out_dir)
+    assert "Hi REDACTED" in flight_out
+
+
+async def test_run_capture_cookie_value_in_output_writes_nothing(tmp_path: Path) -> None:
+    leaky_cookie = "sessionvalue-ABCDEF"
+    responses = [json_response(f"{HUMBLE_BASE}/api/x", {"note": leaky_cookie})]
+    ctx = make_ctx(responses, cookies=[{"name": "s", "value": leaky_cookie}])
+    out_dir = tmp_path / "o"
+
+    with pytest.raises(CaptureLeakError):
+        await capture_run(ctx, make_settings(tmp_path), out_dir, sleep=FakeSleep())
+
+    assert not out_dir.exists()
+    assert list(tmp_path.glob("**/*.json")) == []
+
+
+async def test_run_capture_cookie_read_failure_is_wrapped(tmp_path: Path) -> None:
+    class BrokenContext(FakeContext):
+        async def cookies(self) -> Sequence[Mapping[str, object]]:
+            raise PlaywrightError("closed")
+
+    ctx = BrokenContext(FakePage([]), FakeRequester())
+
+    with pytest.raises(CaptureError):
+        await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
+
+
+async def test_run_capture_fetches_identity_once_after_login_check(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    async def fetch(ctx: SessionContext, settings: Settings) -> list[str]:
+        calls.append(len(ctx.request.__class__.__name__))
+        return []
+
+    ctx = make_ctx()
+
+    await run_capture(
+        ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep(), fetch_identity=fetch
+    )
+
+    assert len(calls) == 1
+
+
+async def test_run_capture_skips_identity_when_session_expired(tmp_path: Path) -> None:
+    called: list[bool] = []
+
+    async def fetch(ctx: SessionContext, settings: Settings) -> list[str]:
+        called.append(True)
+        return []
+
+    probe = FakeResponse(status=HTTP_UNAUTHORIZED, body="", headers=TEXT_HEADERS)
+    ctx = make_ctx(requester=FakeRequester(probe=probe))
+
+    with pytest.raises(SessionExpiredError):
+        await run_capture(ctx, make_settings(tmp_path), tmp_path / "o", fetch_identity=fetch)
+
+    assert called == []
+
+
+async def test_run_capture_clicks_safe_detail_link_and_records_client_navigation(
+    tmp_path: Path,
+) -> None:
+    detail = FakeResponse(
+        url=f"{HUMBLE_BASE}/downloads?key={KEY_A}&_rsc=z",
+        body=f'5:{{"gamekey":"{KEY_A}"}}\n',
+        headers=RSC_HEADERS,
+    )
+    hrefs = [None, 7, "/gift/claim/ClaimToken123", "/redeem", f"/downloads?key={KEY_A}"]
+    ctx = make_ctx(hrefs=hrefs, detail_responses=[detail])
+    out_dir = tmp_path / "o"
+
+    written = await capture_run(ctx, make_settings(tmp_path), out_dir, sleep=FakeSleep())
+
+    assert ctx.page.clicked == [f'a[href="/downloads?key={KEY_A}"]']
+    assert written[0].name == "01-downloads.rsc.txt"
+    assert written[0].read_text(encoding="utf-8") == '5:{"gamekey":"GAMEKEY_0001"}\n'
+    assert KEY_A not in all_output_text(out_dir)
+
+
+async def test_run_capture_logs_when_no_detail_link(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ctx = make_ctx(hrefs=["/gift/claim/Token12345", "/checkout"])
+
+    await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
+
+    messages = [
+        json.loads(line)["msg"]
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("{")
+    ]
+    assert "capture_no_detail_link" in messages
+    assert ctx.page.clicked == []
+
+
+async def test_run_capture_continues_when_detail_click_fails(tmp_path: Path) -> None:
+    ctx = make_ctx(hrefs=["/downloads?key=AnyKey123456"], click_error=PlaywrightError("detached"))
+
+    written = await capture_run(ctx, make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep())
+
+    assert [p.name for p in written] == [INDEX_NAME]
+    assert len(ctx.page.clicked) == 1
+
+
+async def test_run_capture_skips_oversized_body_and_empty_flight(tmp_path: Path) -> None:
+    responses = [
+        FakeResponse(url=f"{HUMBLE_BASE}/huge", body="x" * (MAX_BODY_CHARS + 1)),
+        FakeResponse(url=LIBRARY_URL, body="<html>no flight</html>", headers=HTML_HEADERS),
+    ]
+
+    written = await capture_run(
+        make_ctx(responses), make_settings(tmp_path), tmp_path / "o", sleep=FakeSleep()
+    )
+
+    assert [p.name for p in written] == [INDEX_NAME]
+    index = written[0].read_text(encoding="utf-8")
+    assert "`https://www.humblebundle.com/huge` | - (too large) | index-only |" in index
+    assert "`https://www.humblebundle.com/home/library` | - | index-only |" in index

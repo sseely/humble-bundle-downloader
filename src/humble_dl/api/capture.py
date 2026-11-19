@@ -1,16 +1,17 @@
 """Record library traffic and write sanitized fixtures.
 
 Sanitization is a security boundary: captured output is committed as test
-fixtures. Everything is sanitized in memory (pure functions), verified with
-``assert_clean``, and only then written to disk. Response headers are never
-persisted and non-JSON bodies are never written.
+fixtures. Everything is sanitized in memory (pure functions in ``sanitize`` and
+``rsc``), verified with ``assert_clean``, and only then written to disk.
+Response headers are never persisted; only JSON bodies, RSC flight rows and the
+inline flight data of the library document are written (the HTML never is).
 """
 
 import asyncio
 import json
 import re
-from collections.abc import Awaitable, Callable, Iterable, Iterator
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from urllib.parse import quote, unquote, urlsplit
@@ -18,86 +19,105 @@ from urllib.parse import quote, unquote, urlsplit
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from humble_dl.auth.session import HUMBLE_BASE, MS_PER_S, SessionContext, assert_logged_in
+from humble_dl.api.rsc import (
+    KIND_FLIGHT,
+    KIND_JSON,
+    KIND_RSC,
+    LIBRARY_PATH,
+    ResponseKind,
+    classify_response,
+    extract_flight_from_html,
+    is_humble_host,
+    select_detail_href,
+)
+from humble_dl.api.sanitize import (
+    EMAIL_PLACEHOLDER,
+    EMAIL_RE,
+    GIFT_PATH_RE,
+    SECRET_KEYS,
+    CaptureLeakError,
+    assert_clean,
+    fake_gamekey,
+    flight_gamekeys,
+    identity_pattern,
+    identity_terms,
+    iter_gamekeys,
+    iter_strings,
+    list_gamekeys,
+    redact_text,
+    redact_value,
+    sanitize,
+    sanitize_flight,
+    sanitize_string,
+    text_gamekeys,
+)
+from humble_dl.auth.session import (
+    HUMBLE_BASE,
+    MS_PER_S,
+    SessionContext,
+    assert_logged_in,
+    fetch_identity_secrets,
+)
 from humble_dl.config import Settings
 from humble_dl.lib.logging import get_logger, redact_gamekey, redact_url
 
-GAMEKEY_KEY = "gamekey"
-FAKE_GAMEKEY_FORMAT = "GAMEKEY_{:04d}"
-EMAIL_PLACEHOLDER = "user@example.invalid"
-SECRET_KEYS = frozenset(
-    {
-        "gamekey",
-        "email",
-        "token",
-        "csrf",
-        "cookie",
-        "session",
-        "password",
-        "secret",
-        "auth",
-        "authorization",
-        "uid",
-        "user_id",
-        "userid",
-        "address",
-        "phone",
-        "ip",
-        "ip_address",
-        "payment",
-        "card",
-        "billing",
-        "api_key",
-        "username",
-        "full_name",
-        "first_name",
-        "last_name",
-        "display_name",
-    }
-)
-SECRET_KEY_FRAGMENTS = ("token", "csrf", "secret", "password", "cookie", "session", "email")
+__all__ = [
+    "EMAIL_PLACEHOLDER",
+    "SECRET_KEYS",
+    "CaptureContext",
+    "CaptureError",
+    "CaptureLeakError",
+    "Record",
+    "assert_clean",
+    "build_outputs",
+    "is_humble_host",
+    "list_gamekeys",
+    "run_capture",
+    "sanitize",
+    "select_detail_href",
+]
 
-HUMBLE_DOMAIN = "humblebundle.com"
-LIBRARY_PATH = "/home/library"
 USER_ORDER_PATH = "/api/v1/user/order"
 ORDER_PATH_PREFIX = "/api/v1/order"
 ORDER_QUERY = "all_tpkds=true"
 HTTP_GET = "GET"
 
 MAX_PAGE_RESPONSES = 200
+MAX_BODY_CHARS = 20 * 1024 * 1024
 MAX_ORDERS = 5
 SCROLL_STEPS = 3
 SCROLL_DELTA_PX = 2000
+MIN_COOKIE_CHARS = 8
 
 CONTENT_TYPE_HEADER = "content-type"
-JSON_CONTENT_TYPE = "json"
+KIND_INDEX_ONLY = "index-only"
+TOO_LARGE_NOTE = "too large"
 INDEX_NAME = "INDEX.md"
 JSON_INDENT = 2
 SLUG_MAX_CHARS = 80
 EMPTY_SLUG = "root"
+FLIGHT_SLUG = "library-flight"
 INDEX_HEADER = (
     "# Captured library traffic\n\n"
-    "| NN | Method | Status | URL | File |\n"
-    "|----|--------|--------|-----|------|\n"
+    "| NN | Method | Status | URL | File | Kind |\n"
+    "|----|--------|--------|-----|------|------|\n"
 )
 NO_FILE = "-"
 
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
-URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+LINK_SELECTOR = "a[href]"
+HREF_JS = "els => els.map(e => e.getAttribute('href'))"
+
 ORDER_PATH_RE = re.compile(rf"^{re.escape(ORDER_PATH_PREFIX)}/([^/]+)")
 SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 _log = get_logger(__name__)
 
 Sleep = Callable[[float], Awaitable[None]]
+IdentityFetcher = Callable[[SessionContext, Settings], Awaitable[list[str]]]
 
 
 class CaptureError(Exception):
     """Capture could not complete (browser or request failure); nothing was written."""
-
-
-class CaptureLeakError(Exception):
-    """Sanitized output still contains a captured secret; nothing was written."""
 
 
 class _BodyLike(Protocol):
@@ -136,166 +156,66 @@ class CapturePage(Protocol):
     async def wait_for_load_state(
         self, state: Literal["networkidle"] | None = ..., *, timeout: float | None = ...
     ) -> None: ...
+    async def eval_on_selector_all(self, selector: str, expression: str) -> Any: ...
+    async def click(self, selector: str, *, timeout: float | None = ...) -> None: ...
 
 
 class CaptureContext(SessionContext, Protocol):
     """The slice of ``BrowserContext`` ``run_capture`` uses (real contexts satisfy it)."""
 
     async def new_page(self) -> CapturePage: ...  # pyright: ignore[reportIncompatibleMethodOverride]
+    async def cookies(self) -> Sequence[Mapping[str, object]]: ...
 
 
 @dataclass(frozen=True)
 class Record:
-    """One recorded response; ``body`` is parsed JSON when ``has_json``."""
+    """One recorded response.
+
+    ``body`` is parsed JSON when ``has_json``; ``flight`` is raw flight text for
+    ``rsc``/``flight`` records (``flight_kind`` says which); ``note`` explains skips.
+    """
 
     url: str
     method: str
     status: int
     has_json: bool
     body: Any
+    flight: str | None = None
+    flight_kind: str = KIND_RSC
+    note: str = ""
+
+    @property
+    def kind(self) -> str:
+        """The index "kind" column: json, rsc, flight or index-only."""
+        if self.has_json:
+            return KIND_JSON
+        return self.flight_kind if self.flight is not None else KIND_INDEX_ONLY
 
 
 # --- pure core ---------------------------------------------------------------
 
 
-def assert_clean(text: str, secrets: Iterable[str]) -> None:
-    """Raise if any secret appears in ``text`` (case-insensitive).
-
-    Args:
-        text: Output about to be written.
-        secrets: Original gamekeys and emails captured from the traffic.
-
-    Raises:
-        CaptureLeakError: A secret is present. The message never contains it.
-    """
-    haystack = text.casefold()
-    for secret in secrets:
-        if secret and secret.casefold() in haystack:
-            raise CaptureLeakError("Sanitized output still contains a captured secret")
-
-
-def is_humble_host(url: str) -> bool:
-    """Return True if ``url`` is on humblebundle.com or a subdomain."""
-    host = (urlsplit(url).hostname or "").lower()
-    return host == HUMBLE_DOMAIN or host.endswith(f".{HUMBLE_DOMAIN}")
-
-
-def _fake_gamekey(gamekey: str, gamekey_map: dict[str, str]) -> str:
-    if gamekey not in gamekey_map:
-        gamekey_map[gamekey] = FAKE_GAMEKEY_FORMAT.format(len(gamekey_map) + 1)
-    return gamekey_map[gamekey]
-
-
-def _is_secret_key(folded: str) -> bool:
-    return folded in SECRET_KEYS or any(frag in folded for frag in SECRET_KEY_FRAGMENTS)
-
-
-def _replace_gamekeys(text: str, gamekey_map: dict[str, str]) -> str:
-    """Case-insensitively replace known gamekeys, longest first (prefix-safe)."""
-    if not gamekey_map:
-        return text
-    fakes = {gamekey.lower(): fake for gamekey, fake in gamekey_map.items()}
-    keys = sorted(gamekey_map, key=len, reverse=True)
-    pattern = re.compile("|".join(re.escape(key) for key in keys), re.IGNORECASE)
-    return pattern.sub(lambda match: fakes[match.group(0).lower()], text)
-
-
-def sanitize_string(text: str, gamekey_map: dict[str, str]) -> str:
-    """Replace gamekeys and emails and strip URL queries/fragments in ``text``."""
-    text = _replace_gamekeys(text, gamekey_map)
-    text = EMAIL_RE.sub(EMAIL_PLACEHOLDER, text)
-    return URL_RE.sub(lambda match: redact_url(match.group(0)), text)
-
-
-def _sanitize_dict(obj: dict[str, Any], gamekey_map: dict[str, str]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for key, value in obj.items():
-        folded = str(key).casefold()
-        if folded == GAMEKEY_KEY and isinstance(value, str) and value:
-            out[key] = _fake_gamekey(value, gamekey_map)
-        elif not _is_secret_key(folded):
-            out[sanitize_string(str(key), gamekey_map)] = sanitize(value, gamekey_map)
-    return out
-
-
-def sanitize(obj: Any, gamekey_map: dict[str, str]) -> Any:
-    """Return a sanitized deep copy of a JSON-like ``obj`` (pure apart from the map).
-
-    Gamekeys become stable fakes (``GAMEKEY_0001`` ...) via ``gamekey_map``;
-    emails become a placeholder; URL queries are stripped; secret keys are dropped.
-    Gamekeys not yet in the map are added only when seen under a ``gamekey`` key,
-    so pre-populate the map (see ``build_outputs``) to cover every occurrence.
-
-    Args:
-        obj: Parsed JSON value.
-        gamekey_map: Real gamekey -> fake gamekey; mutated with new entries.
-
-    Returns:
-        The sanitized value.
-    """
-    if isinstance(obj, dict):
-        mapping = cast("dict[str, Any]", obj)
-        return _sanitize_dict(mapping, gamekey_map)
-    if isinstance(obj, list):
-        items = cast("list[Any]", obj)
-        return [sanitize(item, gamekey_map) for item in items]
-    if isinstance(obj, str):
-        return sanitize_string(obj, gamekey_map)
-    return obj
-
-
-def _iter_gamekeys(obj: Any) -> Iterator[str]:
-    if isinstance(obj, dict):
-        mapping = cast("dict[str, Any]", obj)
-        for key, value in mapping.items():
-            if str(key).casefold() == GAMEKEY_KEY and isinstance(value, str) and value:
-                yield value
-            yield from _iter_gamekeys(value)
-    elif isinstance(obj, list):
-        items = cast("list[Any]", obj)
-        for item in items:
-            yield from _iter_gamekeys(item)
-
-
-def list_gamekeys(body: Any) -> list[str]:
-    """Return gamekeys from a ``/user/order`` style body (strings or ``{gamekey}``)."""
-    if not isinstance(body, list):
-        return []
-    items = cast("list[Any]", body)
-    keys: list[str] = [item for item in items if isinstance(item, str) and item]
-    keys.extend(_iter_gamekeys([item for item in items if isinstance(item, dict)]))
-    return keys
-
-
 def _record_gamekeys(record: Record) -> list[str]:
     path = urlsplit(record.url).path
-    keys: list[str] = []
+    keys = text_gamekeys(record.url)
     match = ORDER_PATH_RE.match(path)
     if match:
         keys.append(unquote(match.group(1)))
     if record.has_json:
         if path.rstrip("/") == USER_ORDER_PATH:
             keys.extend(list_gamekeys(record.body))
-        keys.extend(_iter_gamekeys(record.body))
+        keys.extend(iter_gamekeys(record.body))
+        for text in iter_strings(record.body):
+            keys.extend(text_gamekeys(text))
+    if record.flight is not None:
+        keys.extend(flight_gamekeys(record.flight))
     return keys
 
 
-def _iter_strings(obj: Any) -> Iterator[str]:
-    if isinstance(obj, str):
-        yield obj
-    elif isinstance(obj, dict):
-        mapping = cast("dict[str, Any]", obj)
-        for key, value in mapping.items():
-            yield str(key)
-            yield from _iter_strings(value)
-    elif isinstance(obj, list):
-        items = cast("list[Any]", obj)
-        for item in items:
-            yield from _iter_strings(item)
-
-
 def _record_emails(record: Record) -> list[str]:
-    strings = [record.url, *_iter_strings(record.body)]
+    strings = [record.url, *iter_strings(record.body)]
+    if record.flight is not None:
+        strings.append(record.flight)
     found: list[str] = []
     for text in strings:
         found.extend(EMAIL_RE.findall(text))
@@ -309,9 +229,10 @@ def _slug(path: str) -> str:
 
 
 def _index_row(number: int, record: Record, safe_url: str, file_name: str | None) -> str:
+    shown = file_name or (f"{NO_FILE} ({record.note})" if record.note else NO_FILE)
     return (
         f"| {number:02d} | {record.method} | {record.status} "
-        f"| `{redact_url(safe_url)}` | {file_name or NO_FILE} |\n"
+        f"| `{redact_url(safe_url)}` | {shown} | {record.kind} |\n"
     )
 
 
@@ -319,33 +240,61 @@ def _dump(value: Any) -> str:
     return json.dumps(value, indent=JSON_INDENT, ensure_ascii=False) + "\n"
 
 
-def build_outputs(records: list[Record]) -> dict[str, str]:
+def _render(
+    number: int,
+    record: Record,
+    safe_url: str,
+    gamekey_map: dict[str, str],
+    pattern: re.Pattern[str] | None,
+) -> tuple[str, str] | None:
+    """Return ``(file name, sanitized text)`` for a record, or None if index-only."""
+    if record.has_json:
+        body = redact_value(sanitize(record.body, gamekey_map), pattern)
+        return f"{number:02d}-{_slug(urlsplit(safe_url).path)}.json", _dump(body)
+    if record.flight is None:
+        return None
+    slug = FLIGHT_SLUG if record.flight_kind == KIND_FLIGHT else _slug(urlsplit(safe_url).path)
+    return f"{number:02d}-{slug}.rsc.txt", sanitize_flight(record.flight, gamekey_map, pattern)
+
+
+def build_outputs(
+    records: list[Record],
+    identity: Sequence[str] = (),
+    extra_secrets: Sequence[str] = (),
+) -> dict[str, str]:
     """Sanitize ``records`` into ``{file name: text}``; INDEX.md is last (pure).
 
-    Pass 1 collects every gamekey (bodies, order lists, URL paths) so pass 2
-    replaces them everywhere, including file slugs and the index. Every output
-    (names and texts) is then checked with ``assert_clean``.
+    Pass 1 collects every gamekey (bodies, flight rows, order lists, URL paths and
+    ``key=`` queries) so pass 2 replaces them everywhere, including file slugs and
+    the index. Identity values are redacted everywhere. Every output (names and
+    texts) is then checked with ``assert_clean``.
+
+    Args:
+        records: Recorded responses.
+        identity: Account identity strings to redact (values under 3 chars ignored).
+        extra_secrets: Further values that must not appear (e.g. cookie values).
 
     Raises:
-        CaptureLeakError: Any original gamekey or captured email survived.
+        CaptureLeakError: Any secret survived sanitization.
     """
+    terms = identity_terms(identity)
+    pattern = identity_pattern(terms)
     gamekey_map: dict[str, str] = {}
     emails: dict[str, None] = {}
     for record in records:
         for gamekey in _record_gamekeys(record):
-            _fake_gamekey(gamekey, gamekey_map)
+            fake_gamekey(gamekey, gamekey_map)
         emails.update(dict.fromkeys(_record_emails(record)))
     files: dict[str, str] = {}
     index = INDEX_HEADER
     for number, record in enumerate(records, start=1):
-        safe_url = sanitize_string(record.url, gamekey_map)
-        file_name = None
-        if record.has_json:
-            file_name = f"{number:02d}-{_slug(urlsplit(safe_url).path)}.json"
-            files[file_name] = _dump(sanitize(record.body, gamekey_map))
-        index += _index_row(number, record, safe_url, file_name)
+        safe_url = redact_text(sanitize_string(record.url, gamekey_map), pattern)
+        rendered = _render(number, record, safe_url, gamekey_map, pattern)
+        if rendered is not None:
+            files[rendered[0]] = rendered[1]
+        index += _index_row(number, record, safe_url, rendered[0] if rendered else None)
     files[INDEX_NAME] = index
-    secrets = [*gamekey_map, *emails]
+    secrets = [*gamekey_map, *emails, *terms, *extra_secrets]
     for name, text in files.items():
         assert_clean(name, secrets)
         assert_clean(text, secrets)
@@ -357,22 +306,42 @@ def build_outputs(records: list[Record]) -> dict[str, str]:
 
 def _loggable_path(url: str) -> str:
     path = urlsplit(url).path
-    return ORDER_PATH_RE.sub(lambda m: f"{ORDER_PATH_PREFIX}/{redact_gamekey(m.group(1))}", path)
+    path = ORDER_PATH_RE.sub(lambda m: f"{ORDER_PATH_PREFIX}/{redact_gamekey(m.group(1))}", path)
+    return GIFT_PATH_RE.sub(lambda m: f"/gift/{redact_gamekey(m.group(1))}", path)
 
 
-async def _read_json(response: _BodyLike) -> tuple[bool, Any]:
-    if JSON_CONTENT_TYPE not in response.headers.get(CONTENT_TYPE_HEADER, "").lower():
-        return False, None
+async def _read_text(response: _BodyLike) -> str | None:
     try:
-        return True, json.loads(await response.text())
-    except (PlaywrightError, ValueError):
-        return False, None
+        return await response.text()
+    except PlaywrightError:
+        return None
+
+
+def _parse_body(base: Record, kind: ResponseKind, text: str) -> Record:
+    if kind == KIND_JSON:
+        try:
+            return replace(base, has_json=True, body=json.loads(text))
+        except (ValueError, RecursionError):
+            return base
+    flight = text if kind == KIND_RSC else extract_flight_from_html(text)
+    return replace(base, flight=flight, flight_kind=kind) if flight else base
+
+
+async def _response_record(response: _BodyLike, url: str, method: str) -> Record:
+    base = Record(url, method, response.status, False, None)
+    kind = classify_response(url, response.headers.get(CONTENT_TYPE_HEADER, ""))
+    text = await _read_text(response) if kind else None
+    if kind is None or text is None:
+        return base
+    if len(text) > MAX_BODY_CHARS:
+        return replace(base, note=TOO_LARGE_NOTE)
+    return _parse_body(base, kind, text)
 
 
 def _log_record(record: Record) -> None:
     _log.info(
         "capture_response",
-        extra={"path": _loggable_path(record.url), "status": record.status},
+        extra={"path": _loggable_path(record.url), "status": record.status, "kind": record.kind},
     )
 
 
@@ -389,10 +358,30 @@ class _ResponseCollector:
 
 
 async def _page_record(response: PageResponse) -> Record:
-    has_json, body = await _read_json(response)
-    record = Record(response.url, response.request.method, response.status, has_json, body)
+    record = await _response_record(response, response.url, response.request.method)
     _log_record(record)
     return record
+
+
+async def _wait_idle(page: CapturePage, timeout_ms: float) -> None:
+    try:
+        await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except PlaywrightTimeoutError:
+        _log.warning("capture_network_not_idle")
+
+
+async def _open_detail(page: CapturePage, timeout_ms: float) -> None:
+    """Best-effort: click one safe library-item link so client-navigation RSC is captured."""
+    try:
+        raw = cast("list[Any]", await page.eval_on_selector_all(LINK_SELECTOR, HREF_JS))
+        href = select_detail_href(item for item in raw if isinstance(item, str))
+        if href is None:
+            _log.info("capture_no_detail_link")
+            return
+        await page.click(f"{LINK_SELECTOR[:-1]}={json.dumps(href)}]", timeout=timeout_ms)
+        await _wait_idle(page, timeout_ms)
+    except PlaywrightError:
+        _log.warning("capture_detail_navigation_failed")
 
 
 async def _load_library(page: CapturePage, settings: Settings) -> None:
@@ -400,10 +389,8 @@ async def _load_library(page: CapturePage, settings: Settings) -> None:
     await page.goto(HUMBLE_BASE + LIBRARY_PATH, timeout=timeout_ms)
     for _ in range(SCROLL_STEPS):
         await page.mouse.wheel(0, SCROLL_DELTA_PX)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=timeout_ms)
-        except PlaywrightTimeoutError:
-            _log.warning("capture_network_not_idle")
+        await _wait_idle(page, timeout_ms)
+    await _open_detail(page, timeout_ms)
 
 
 async def _record_library_page(ctx: CaptureContext, settings: Settings) -> list[Record]:
@@ -421,10 +408,9 @@ async def _legacy_get(ctx: CaptureContext, settings: Settings, path: str) -> Rec
     url = HUMBLE_BASE + path
     try:
         response = await ctx.request.get(url, timeout=settings.api_timeout_s * MS_PER_S)
-        has_json, body = await _read_json(response)
+        record = await _response_record(response, url, HTTP_GET)
     except PlaywrightError as exc:
         raise CaptureError("Legacy API call failed: browser request error") from exc
-    record = Record(url, HTTP_GET, response.status, has_json, body)
     _log_record(record)
     return record
 
@@ -441,12 +427,27 @@ async def _record_legacy(ctx: CaptureContext, settings: Settings, sleep: Sleep) 
     return records
 
 
+async def _cookie_secrets(ctx: CaptureContext) -> list[str]:
+    """Cookie values worth guarding (never written or logged); raw and decoded forms."""
+    try:
+        cookies = await ctx.cookies()
+    except PlaywrightError as exc:
+        raise CaptureError("Could not read browser cookies") from exc
+    secrets: dict[str, None] = {}
+    for cookie in cookies:
+        value = cookie.get("value")
+        if isinstance(value, str) and len(value) >= MIN_COOKIE_CHARS:
+            secrets[value] = None
+            secrets[unquote(value)] = None
+    return [value for value in secrets if len(value) >= MIN_COOKIE_CHARS]
+
+
 def _write_outputs(out_dir: Path, outputs: dict[str, str]) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for name, text in outputs.items():
         path = out_dir / name
-        path.write_text(text, encoding="utf-8")
+        path.write_text(text, encoding="utf-8", errors="replace")
         written.append(path)
     return written
 
@@ -457,6 +458,7 @@ async def run_capture(
     out_dir: Path,
     *,
     sleep: Sleep = asyncio.sleep,
+    fetch_identity: IdentityFetcher = fetch_identity_secrets,
 ) -> list[Path]:
     """Record library traffic and write sanitized fixtures plus ``INDEX.md``.
 
@@ -465,9 +467,10 @@ async def run_capture(
         settings: Provides timeouts.
         out_dir: Destination directory (created on success only).
         sleep: Async sleep used to rate-limit legacy calls (injectable).
+        fetch_identity: Returns account identity strings to redact (injectable).
 
     Returns:
-        Paths written: one ``NN-<slug>.json`` per JSON response, then ``INDEX.md``.
+        Paths written: one file per JSON/RSC/flight response, then ``INDEX.md``.
 
     Raises:
         SessionExpiredError: Session is not logged in (propagated unchanged).
@@ -476,10 +479,12 @@ async def run_capture(
         CaptureLeakError: Sanitization verification failed; nothing written.
     """
     await assert_logged_in(ctx, settings)
+    identity = await fetch_identity(ctx, settings)
+    cookie_secrets = await _cookie_secrets(ctx)
     records = [
         *await _record_library_page(ctx, settings),
         *await _record_legacy(ctx, settings, sleep),
     ]
-    written = _write_outputs(out_dir, build_outputs(records))
+    written = _write_outputs(out_dir, build_outputs(records, identity, cookie_secrets))
     _log.info("capture_complete", extra={"count": len(records), "out_dir": str(out_dir)})
     return written
