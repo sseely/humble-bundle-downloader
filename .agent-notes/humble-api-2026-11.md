@@ -72,3 +72,9 @@
 - **Finding**: Next.js server-action POSTs (`Next-Action` header) from headless Chromium get 403 with Cloudflare's "Attention Required!" page; the same requests from headed Chromium get 200. Page GETs succeed headless. The only differing request header seen was the UA (`HeadlessChrome/...` vs `Chrome/...`). `getSignedUrlsForEntitlements([entitlementId])` returns `data.signedUrls[subproductMachineName][downloadKey][filename] = "https://cdn.humble.com/humblebundle/<filename>?<signature>"`. Action ids are per-deploy (`70f766da...` getSignedUrls, `40528d76...` recordDownload at time of writing).
 - **Impact**: Signed URLs require a headed browser (or a non-headless fingerprint). Files are served from `cdn.humble.com`, not `dl.humble.com`.
 - **Confidence**: High (back-to-back headless/headed runs, same profile)
+
+## Observation: signed-URL action errors and audiobooks (2026-11-19)
+- **Context**: Live `humble-dl sync` dry runs over a 12-bundle library.
+- **Finding**: `getSignedUrlsForEntitlements` can answer HTTP 200 with `{"ok":false,"code":"upstream_error","retryable":true}`; a retry about 1 s later succeeded. Each call took ~10 s server-side on first request, ~0.4 s when cached. Some book bundles include audiobook downloads (`*-mp3.zip`, `*-flac.zip`, non-ebook platform) on audio-only entitlements; they are never signed when only ebook entitlements are requested.
+- **Impact**: Treat `ok:false` as an API error (retry when `retryable`), not schema drift; map and report signed URLs for ebook downloads only.
+- **Confidence**: High (live runs)
