@@ -42,3 +42,15 @@
   non-JSON payloads to discover where library data lives.
 - **Confidence**: High (routes gone, auth host); Medium (library is RSC —
   needs a logged-in capture to confirm)
+
+## Observation: Kratos session cookie is not persisted by Chromium profiles
+- **Context**: After a successful `humble-dl login` (whoami 200), the next
+  `humble-dl capture` in a fresh persistent context got whoami 401.
+- **Finding**: The profile Cookies DB held only Cloudflare persistent cookies
+  (`__cf_bm`, `__cflb` on auth.humblebundle.com); no session cookie. Humble's
+  Kratos session cookie has no Expires, and Chromium does not persist
+  session cookies in a persistent profile.
+- **Impact**: Login must re-add expiry-less humblebundle.com cookies with the
+  Kratos session `expires_at` before closing the context, or every later
+  command is logged out.
+- **Confidence**: High
