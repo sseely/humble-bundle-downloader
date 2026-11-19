@@ -27,6 +27,7 @@ from humble_dl.api.capture_page import (
     load_library,
     open_bundle,
     request_signed_urls,
+    server_action_id,
 )
 from humble_dl.api.rsc import (
     KIND_FLIGHT,
@@ -306,16 +307,21 @@ async def _response_record(response: BodyLike, url: str, method: str) -> Record:
     return _parse_body(base, kind, text)
 
 
-def _log_record(record: Record) -> None:
-    _log.info(
-        "capture_response",
-        extra={"path": _loggable_path(record.url), "status": record.status, "kind": record.kind},
-    )
+def _log_record(record: Record, action: str | None = None) -> None:
+    extra: dict[str, object] = {
+        "path": _loggable_path(record.url),
+        "method": record.method,
+        "status": record.status,
+        "kind": record.kind,
+    }
+    if action is not None:
+        extra["action"] = action
+    _log.info("capture_response", extra=extra)
 
 
 async def _page_record(response: PageResponse) -> Record:
     record = await _response_record(response, response.url, response.request.method)
-    _log_record(record)
+    _log_record(record, server_action_id(response))
     return record
 
 

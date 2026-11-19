@@ -28,7 +28,11 @@ from humble_dl.api.capture import (
     build_outputs,
     run_capture,
 )
-from humble_dl.api.capture_page import DISABLE_WINDOW_OPEN_JS, FORMAT_BUTTON_SELECTOR
+from humble_dl.api.capture_page import (
+    ACTION_SETTLE_MS,
+    DISABLE_WINDOW_OPEN_JS,
+    FORMAT_BUTTON_SELECTOR,
+)
 from humble_dl.auth.session import (
     HUMBLE_BASE,
     BotChallengeError,
@@ -75,6 +79,7 @@ def make_settings(tmp_path: Path) -> Settings:
 @dataclass
 class FakeRequest:
     method: str
+    headers: dict[str, str] = field(default_factory=dict[str, str])
 
 
 @dataclass
@@ -82,6 +87,7 @@ class FakeResponse:
     url: str = ""
     status: int = HTTP_OK
     method: str = "GET"
+    action: str | None = None
     body: str = "{}"
     headers: dict[str, str] = field(default_factory=lambda: dict(JSON_HEADERS))
     text_error: Exception | None = None
@@ -89,7 +95,7 @@ class FakeResponse:
 
     @property
     def request(self) -> FakeRequest:
-        return FakeRequest(self.method)
+        return FakeRequest(self.method, {"next-action": self.action} if self.action else {})
 
     async def json(self) -> Any:
         if self.json_error is not None:
@@ -169,6 +175,7 @@ class FakePage:
         self.clicked: list[str] = []
         self.emitted: list[FakeResponse] = []
         self.waited_events: list[str] = []
+        self.settled_ms: list[float] = []
         self._clicked = asyncio.Event()
 
     def on(self, event: Literal["response"], f: Callable[[Any], None]) -> None:
@@ -199,6 +206,9 @@ class FakePage:
 
     async def eval_on_selector_all(self, selector: str, expression: str) -> Any:
         return self.scripts
+
+    async def wait_for_timeout(self, timeout: float) -> None:
+        self.settled_ms.append(timeout)
 
     async def evaluate(self, expression: str) -> Any:
         self.evaluated.append(expression)
@@ -867,8 +877,12 @@ async def test_run_capture_reads_list_bodies_before_opening_bundle(tmp_path: Pat
     assert names[:2] == ["01-library-flight.rsc.txt", "02-library-detail-flight.rsc.txt"]
 
 
-async def test_run_capture_requests_signed_urls_with_window_open_disabled(tmp_path: Path) -> None:
-    signed = FakeResponse(url=DETAIL_URL, method="POST", body=SIGNED_RSC, headers=RSC_HEADERS)
+async def test_run_capture_requests_signed_urls_with_window_open_disabled(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    signed = FakeResponse(
+        url=DETAIL_URL, method="POST", body=SIGNED_RSC, headers=RSC_HEADERS, action="70f766da"
+    )
     ctx = make_ctx(scripts=[BUNDLE_SCRIPT], click_responses=[signed])
     out_dir = tmp_path / "o"
 
@@ -877,6 +891,12 @@ async def test_run_capture_requests_signed_urls_with_window_open_disabled(tmp_pa
     assert ctx.page.evaluated == [DISABLE_WINDOW_OPEN_JS]
     assert ctx.page.clicked == [f"click:{FORMAT_BUTTON_SELECTOR}"]
     assert ctx.page.waited_events == ["response"]
+    assert ctx.page.settled_ms == [ACTION_SETTLE_MS]
+    logs = [
+        json.loads(line) for line in capsys.readouterr().err.splitlines() if line.startswith("{")
+    ]
+    posts = [entry for entry in logs if entry.get("method") == "POST"]
+    assert [(entry["action"], entry["status"]) for entry in posts] == [("70f766da", HTTP_OK)]
     text = written[0].read_text(encoding="utf-8")
     assert '"web":"https://cdn.x.net/REDACTED/k.epub"' in text
     assert "TOKEN9SECRET" not in all_output_text(out_dir)

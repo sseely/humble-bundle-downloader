@@ -27,6 +27,10 @@ FORMAT_BUTTON_SELECTOR = 'button:has-text(" KB)"), button:has-text(" MB)"), butt
 CLICK_EVENT = "click"
 RESPONSE_EVENT = "response"
 HTTP_POST = "POST"
+NEXT_ACTION_HEADER = "next-action"
+# After the first server-action response, keep listening so follow-up actions
+# (e.g. recordDownload after getSignedUrlsForEntitlements) are also recorded.
+ACTION_SETTLE_MS = 3000
 DISABLE_WINDOW_OPEN_JS = "() => { window.open = () => null; }"
 
 _log = get_logger(__name__)
@@ -45,6 +49,8 @@ class BodyLike(Protocol):
 class _RequestLike(Protocol):
     @property
     def method(self) -> str: ...
+    @property
+    def headers(self) -> dict[str, str]: ...
 
 
 class PageResponse(BodyLike, Protocol):
@@ -72,6 +78,7 @@ class CapturePage(Protocol):
     ) -> None: ...
     async def eval_on_selector_all(self, selector: str, expression: str) -> Any: ...
     async def evaluate(self, expression: str) -> Any: ...
+    async def wait_for_timeout(self, timeout: float) -> None: ...
     async def dispatch_event(
         self, selector: str, type: str, *, timeout: float | None = ...
     ) -> None: ...
@@ -171,3 +178,10 @@ async def request_signed_urls(page: CapturePage, timeout_ms: float) -> None:
         await waiter
     except PlaywrightError as exc:
         _log.warning("capture_signed_url_response_missing", extra={"reason": _first_line(exc)})
+        return
+    await page.wait_for_timeout(ACTION_SETTLE_MS)
+
+
+def server_action_id(response: PageResponse) -> str | None:
+    """The ``Next-Action`` id of a server-action request (per-deploy; not secret)."""
+    return response.request.headers.get(NEXT_ACTION_HEADER)
