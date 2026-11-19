@@ -24,3 +24,21 @@
   and 3.14 as "bugfix" (EOL 2030-10). The plan pins 3.13 (D1).
 - **Impact**: Fine to ship; 3.14 is the better default if D1 is revisited.
 - **Confidence**: High
+
+## Observation: Legacy /api/v1 routes are gone; site is Next.js + Ory Kratos
+- **Context**: First `humble-dl login` run (2026-11-19) exited 1: probe
+  `/api/v1/user/order` returned 404 on the first poll.
+- **Finding**: Logged-out curl: `/api/v1/user/order`, `/api/v1/order/<key>`,
+  `/api/v1/user`, `/api/v2/user/order` and `/login` all return the Next.js
+  HTML 404 page (same as a nonsense path), not an API 401/JSON error.
+  `/home/library` server-redirects (RSC `NEXT_REDIRECT`, 307) to
+  `https://auth.humblebundle.com/self-service/login/browser?return_to=...`
+  (Ory Kratos). Kratos `GET auth.humblebundle.com/sessions/whoami` → 401 JSON
+  when logged out; `GET www.humblebundle.com/api/auth/session-status` → 200
+  `{"status":"anonymous"}`. Client JS bundles reference no order/library API
+  path; library data is likely server-rendered (RSC), not a JSON API.
+- **Impact**: D3 (library JSON via legacy API) is contradicted. Session probe
+  and login path in auth/session.py must change; capture must record RSC /
+  non-JSON payloads to discover where library data lives.
+- **Confidence**: High (routes gone, auth host); Medium (library is RSC —
+  needs a logged-in capture to confirm)
