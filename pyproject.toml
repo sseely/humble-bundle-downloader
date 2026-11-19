@@ -1,0 +1,63 @@
+[project]
+name = "humble-dl"
+version = "0.1.0"
+description = "Download every ebook in every format from your Humble Bundle library."
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "playwright==1.65.2",
+    "httpx==0.28.1",
+    "typer==0.29.2",
+    "pydantic==2.14.3",
+]
+
+[project.scripts]
+humble-dl = "humble_dl.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/humble_dl"]
+
+[dependency-groups]
+dev = [
+    "pytest==9.2.0",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-httpx==0.36.2",
+    "ruff==0.17.5",
+    "pyright==1.1.414",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-m 'not live'"
+markers = ["live: hits the real Humble Bundle service (run explicitly with -m live)"]
+
+[tool.coverage.run]
+source = ["humble_dl"]
+branch = true
+omit = ["tests/helpers/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "strict"
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"

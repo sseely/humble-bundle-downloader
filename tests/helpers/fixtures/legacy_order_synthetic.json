@@ -1,0 +1,168 @@
+{
+  "gamekey": "FAKEGAMEKEY0001",
+  "uid": "FAKEUID",
+  "created": "2026-01-01T00:00:00.000000",
+  "amount_spent": 15.0,
+  "product": {
+    "category": "bundle",
+    "machine_name": "fakebundle",
+    "human_name": "Fake Ebook Bundle: Learn Things",
+    "supports_canonical": true
+  },
+  "subproducts": [
+    {
+      "machine_name": "fake_book_one",
+      "human_name": "Fake Book One",
+      "payee": {
+        "human_name": "Fake Publisher",
+        "machine_name": "fakepub"
+      },
+      "library_family_name": null,
+      "downloads": [
+        {
+          "platform": "ebook",
+          "machine_name": "fake_book_one_ebook",
+          "options_dict": {},
+          "download_struct": [
+            {
+              "name": "PDF",
+              "url": {
+                "web": "https://dl.humble.com/fake_book_one.pdf?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken",
+                "bittorrent": "https://dl.humble.com/torrents/fake_book_one.pdf.torrent?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken"
+              },
+              "md5": "00000000000000000000000000000004",
+              "sha1": "0000000000000000000000000000000000000000",
+              "file_size": 12345679,
+              "human_size": "11 MB"
+            },
+            {
+              "name": "EPUB",
+              "url": {
+                "web": "https://dl.humble.com/fake_book_one.epub?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken",
+                "bittorrent": "https://dl.humble.com/torrents/fake_book_one.epub.torrent?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken"
+              },
+              "md5": "00000000000000000000000000000005",
+              "sha1": "0000000000000000000000000000000000000000",
+              "file_size": 2345679,
+              "human_size": "2 MB"
+            },
+            {
+              "name": "MOBI",
+              "url": {
+                "web": "https://dl.humble.com/fake_book_one.mobi?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken",
+                "bittorrent": "https://dl.humble.com/torrents/fake_book_one.mobi.torrent?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken"
+              },
+              "md5": "00000000000000000000000000000006",
+              "sha1": "0000000000000000000000000000000000000000",
+              "file_size": 3456790,
+              "human_size": "3 MB"
+            },
+            {
+              "name": "Streaming",
+              "external_link": "https://example.invalid/read",
+              "human_size": "n/a"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "machine_name": "fake_game",
+      "human_name": "Fake Game",
+      "downloads": [
+        {
+          "platform": "windows",
+          "download_struct": [
+            {
+              "name": "Download",
+              "url": {
+                "web": "https://dl.humble.com/fake_game.zip?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken",
+                "bittorrent": "https://dl.humble.com/torrents/fake_game.zip.torrent?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken"
+              },
+              "md5": "00000000000000000000000000000063",
+              "sha1": "0000000000000000000000000000000000000000",
+              "file_size": 987654321,
+              "human_size": "941 MB"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "machine_name": "fake_book_two",
+      "human_name": "Fake Book Two: Subtitle",
+      "payee": {
+        "human_name": "Fake Publisher",
+        "machine_name": "fakepub"
+      },
+      "library_family_name": null,
+      "downloads": [
+        {
+          "platform": "ebook",
+          "machine_name": "fake_book_two_ebook",
+          "options_dict": {},
+          "download_struct": [
+            {
+              "name": "PDF",
+              "url": {
+                "web": "https://dl.humble.com/fake_book_two.pdf?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken",
+                "bittorrent": "https://dl.humble.com/torrents/fake_book_two.pdf.torrent?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken"
+              },
+              "md5": "00000000000000000000000000000007",
+              "sha1": "0000000000000000000000000000000000000000",
+              "file_size": 12345680,
+              "human_size": "11 MB"
+            },
+            {
+              "name": "EPUB",
+              "url": {
+                "web": "https://dl.humble.com/fake_book_two.epub?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken",
+                "bittorrent": "https://dl.humble.com/torrents/fake_book_two.epub.torrent?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken"
+              },
+              "md5": "00000000000000000000000000000008",
+              "sha1": "0000000000000000000000000000000000000000",
+              "file_size": 2345680,
+              "human_size": "2 MB"
+            },
+            {
+              "name": "MOBI",
+              "url": {
+                "web": "https://dl.humble.com/fake_book_two.mobi?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken",
+                "bittorrent": "https://dl.humble.com/torrents/fake_book_two.mobi.torrent?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken"
+              },
+              "md5": "00000000000000000000000000000009",
+              "sha1": "0000000000000000000000000000000000000000",
+              "file_size": 3456791,
+              "human_size": "3 MB"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "machine_name": "fake_album",
+      "human_name": "Fake Album",
+      "downloads": [
+        {
+          "platform": "audio",
+          "download_struct": [
+            {
+              "name": "MP3",
+              "url": {
+                "web": "https://dl.humble.com/fake_album.zip?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken",
+                "bittorrent": "https://dl.humble.com/torrents/fake_album.zip.torrent?gamekey=FAKEGAMEKEY0001&ttl=1&t=faketoken"
+              },
+              "md5": "00000000000000000000000000000062",
+              "sha1": "0000000000000000000000000000000000000000",
+              "file_size": 55555555,
+              "human_size": "52 MB"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "tpkd_dict": {
+    "all_tpkds": []
+  }
+}

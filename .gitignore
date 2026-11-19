@@ -2,3 +2,13 @@
 plans/
 .claude/
 .plan-mission-progress.md
+.venv/
+__pycache__/
+*.part
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+dist/
+.coverage.*
