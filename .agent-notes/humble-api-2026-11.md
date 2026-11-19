@@ -60,3 +60,9 @@
 - **Finding**: Playwright 1.65 runs `headless=True` without a channel on the separate `chromium-headless-shell` binary (driver coreBundle.js `getExecutableName`). It loaded none of the encrypted (v11) cookies headed Chromium wrote, and a later headed run also saw none, consistent with the shell discarding them. `channel="chromium"` (same binary, new headless) loads them and whoami returns 200.
 - **Impact**: Any persistent-profile context shared between headed and headless runs must pass `channel="chromium"`.
 - **Confidence**: High (controlled back-to-back experiment on the same profile)
+
+## Observation: library list omits per-file data; files live on the bundle detail page (2026-11-19)
+- **Context**: First successful `humble-dl capture` of `/home/library` after the redesign.
+- **Finding**: The list page's RSC flight data carries `bundleItems[]` (id = productEntitlementId UUID, title, `type: "bundle"`, `itemType: "content-entitlement"`, `entitlements.downloads[]`) with per-file `downloads` and `signedUrls` set to `"$undefined"`. Each bundle's books and format download buttons (e.g. "EPUB (2.9 MB)", format selector, Bulk Download) are on `/home/library/<productEntitlementId>`. Rows are not `<a href>` links. The page also has "Purchased" and "Bundles" tabs. Two Next.js server-action POSTs to `/home/library` returned 403 under capture.
+- **Impact**: The library client must enumerate bundle ids from the list page, then read each detail page. A "still migrating" banner on the page does not mean files are missing.
+- **Confidence**: High (capture + human screenshots)
