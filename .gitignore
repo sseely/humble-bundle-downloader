@@ -12,3 +12,5 @@ htmlcov/
 .ruff_cache/
 dist/
 .coverage.*
+# raw library captures: may hold real account data; scrub before committing any
+tests/helpers/fixtures/captured/
