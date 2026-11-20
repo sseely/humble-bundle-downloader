@@ -1,6 +1,7 @@
 """Tests for the CLI shell: exit codes, messages, injection seams."""
 
 import json
+import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,6 +23,7 @@ from humble_dl.auth.session import (
 )
 from humble_dl.config import ConfigError, Settings
 from humble_dl.models.library import SchemaDriftError
+from humble_dl.services import books as books_service
 from humble_dl.services.planner import ArchiveThenFetch, Fetch, FileKey, Skip
 from humble_dl.services.sync import (
     InsufficientSpaceError,
@@ -30,6 +32,7 @@ from humble_dl.services.sync import (
     SyncDeps,
     SyncOptions,
 )
+from tests.helpers.books import FakeBooks
 
 ENV_CONCURRENCY = "HUMBLE_DL_CONCURRENCY"
 ENV_PROFILE = "HUMBLE_DL_PROFILE_DIR"
@@ -404,3 +407,181 @@ async def test_make_library_builds_client_on_new_page(tmp_path: Path) -> None:
     library = await cli._make_library(cast("cli.BrowserLike", ctx), settings)  # pyright: ignore[reportPrivateUsage]
     assert ctx.pages == 1
     assert type(library).__name__ == "LibraryClient"
+
+
+def install_books(
+    monkeypatch: pytest.MonkeyPatch, rec: FakeBooks, platform: str = "darwin"
+) -> None:
+    monkeypatch.setattr(cli, "BOOKS_DEPS", lambda: rec.deps(platform))
+
+
+def seed_books(out: Path, count: int) -> list[Path]:
+    paths = [out / "Bundle" / f"Item{n}" / f"book{n}.epub" for n in range(count)]
+    for path in paths:
+        path.parent.mkdir(parents=True)
+        path.write_text("x")
+    return paths
+
+
+def test_books_imports_then_skips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rec = FakeBooks(tmp_path / "bks")
+    install_books(monkeypatch, rec)
+    out = tmp_path / "lib"
+    seed_books(out, 3)
+    first = invoke("books", "--output", str(out), "--pause", "1")
+    assert first.exit_code == cli.EXIT_OK
+    assert "selected 3, already imported 0, imported 3, changed 0, failed 0" in first.stdout
+    assert [len(call) for call in rec.calls] == [4, 4, 4]  # open -a Books <one file>
+    assert rec.sleeps == [1.0, 1.0]
+    rec.forget()
+    second = invoke("books", "--output", str(out))
+    assert second.exit_code == cli.EXIT_OK
+    assert "selected 3, already imported 3, imported 0, changed 0, failed 0" in second.stdout
+    assert len(rec.calls) == 3
+
+
+def test_books_failed_file_exits_4_and_lists_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rec = FakeBooks(tmp_path / "bks", fail_on=frozenset({2}))
+    install_books(monkeypatch, rec)
+    out = tmp_path / "lib"
+    files = [p.resolve() for p in seed_books(out, 3)]
+    result = invoke("books", "--output", str(out), "--pause", "0")
+    assert result.exit_code == cli.EXIT_FILES
+    assert "1 file(s) failed to import into Books:" in result.stderr
+    assert str(files[1]) in result.stderr
+    assert str(files[0]) not in result.stderr
+    assert "failed 1" in result.stdout
+
+
+def test_books_corrupt_state_exits_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, isolated_home: Path
+) -> None:
+    rec = FakeBooks(tmp_path / "bks")
+    install_books(monkeypatch, rec)
+    out = tmp_path / "lib"
+    seed_books(out, 1)
+    state = isolated_home / ".humble-dl" / "books-imported.json"
+    state.parent.mkdir()
+    state.write_text("garbage")
+    result = invoke("books", "--output", str(out))
+    assert result.exit_code == cli.EXIT_CONFIG
+    assert "corrupt" in result.stderr
+    assert rec.calls == []
+
+
+def test_books_non_darwin_exits_1(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rec = FakeBooks(tmp_path / "bks")
+    install_books(monkeypatch, rec, platform="linux")
+    out = tmp_path / "lib"
+    seed_books(out, 1)
+    result = invoke("books", "--output", str(out))
+    assert result.exit_code == cli.EXIT_CONFIG
+    assert "Apple Books import requires macOS." in result.stderr
+    assert rec.calls == []
+
+
+def test_books_dry_run_on_non_darwin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, isolated_home: Path
+) -> None:
+    rec = FakeBooks(tmp_path / "bks")
+    install_books(monkeypatch, rec, platform="linux")
+    out = tmp_path / "lib"
+    seed_books(out, 2)
+    result = invoke("books", "--output", str(out), "--dry-run")
+    assert result.exit_code == cli.EXIT_OK
+    assert result.stdout.splitlines() == [
+        "import Bundle/Item0/book0.epub",
+        "import Bundle/Item1/book1.epub",
+        "Dry run: 2 files to import.",
+    ]
+    assert rec.calls == []
+    assert not (isolated_home / ".humble-dl").exists()
+
+
+@pytest.mark.parametrize("args", [["--pause", "-1"], ["--pause", "61"]])
+def test_books_invalid_options_exit_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, args: list[str]
+) -> None:
+    rec = FakeBooks(tmp_path / "bks")
+    install_books(monkeypatch, rec)
+    result = invoke("books", "--output", str(tmp_path), *args)
+    assert result.exit_code == cli.EXIT_CONFIG
+    assert rec.calls == []
+
+
+def test_books_only_filter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rec = FakeBooks(tmp_path / "bks")
+    install_books(monkeypatch, rec)
+    out = tmp_path / "lib"
+    seed_books(out, 1)
+    result = invoke("books", "--output", str(out), "--only", "nomatch")
+    assert result.exit_code == cli.EXIT_OK
+    assert "selected 0" in result.stdout
+    assert rec.calls == []
+
+
+def test_books_default_deps_are_real() -> None:
+    deps = cli.BOOKS_DEPS()
+    assert deps.runner is books_service.run_open
+    assert deps.platform == sys.platform
+
+
+def test_books_summary_has_skip_counts_and_dry_run_lines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    out, library = tmp_path / "lib", tmp_path / "bks"
+    seed_books(out, 1)
+    other = out / "Other" / "Item" / "book0.pdf"
+    other.parent.mkdir(parents=True)
+    other.write_text("x")
+    (out / "Bundle" / "Item1" / "x.epub").parent.mkdir(parents=True)
+    (out / "Bundle" / "Item1" / "x.epub").write_text("x")
+    (library / "x.epub").mkdir(parents=True)
+    rec = FakeBooks(library)
+    install_books(monkeypatch, rec)
+    dry = invoke("books", "--output", str(out), "--dry-run")
+    assert dry.stdout.splitlines() == [
+        "import Bundle/Item0/book0.epub",
+        "skip-duplicate Other/Item/book0.pdf",
+        "skip-in-books Bundle/Item1/x.epub",
+        "Dry run: 1 files to import.",
+    ]
+    result = invoke("books", "--output", str(out), "--pause", "0")
+    assert result.exit_code == cli.EXIT_OK
+    assert (
+        "selected 3, already imported 0, imported 1, changed 0, failed 0, "
+        "duplicate in another bundle 1, already in Books 1"
+    ) in result.stdout
+    assert len(rec.calls) == 1
+
+
+def test_books_duplicates_command_reports_and_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, isolated_home: Path
+) -> None:
+    library = tmp_path / "bks"
+    (library / "x.epub").mkdir(parents=True)
+    (library / "x_1234567890.pdf").write_text("x")
+    rec = FakeBooks(library)
+    install_books(monkeypatch, rec)
+    result = invoke("books-duplicates")
+    assert result.exit_code == cli.EXIT_OK
+    assert result.stdout.splitlines() == [
+        "x.epub | x_1234567890.pdf",
+        "1 book(s) with more than one copy in Books.",
+    ]
+    assert rec.calls == []
+    assert not (isolated_home / ".humble-dl").exists()
+
+
+def test_books_missing_library_exits_1(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rec = FakeBooks(tmp_path / "bks")
+    rec.library.rmdir()
+    install_books(monkeypatch, rec)
+    out = tmp_path / "lib"
+    seed_books(out, 1)
+    result = invoke("books", "--output", str(out))
+    assert result.exit_code == cli.EXIT_CONFIG
+    assert "imports cannot be confirmed" in result.stderr
+    assert rec.calls == []

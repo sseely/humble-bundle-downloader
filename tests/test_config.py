@@ -22,6 +22,7 @@ def test_defaults_with_empty_env() -> None:
     assert s.profile_dir == Path("/h/.humble-dl/profile")
     assert s.debug_dir == Path("/h/.humble-dl/debug")
     assert s.hash_cache_path == Path("/h/.humble-dl/hash-cache.json")
+    assert s.books_state_path == Path("/h/.humble-dl/books-imported.json")
     assert s.concurrency == 4
     assert s.api_rps == 2.0
     assert s.http_timeout_s == 30.0

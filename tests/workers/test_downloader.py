@@ -81,6 +81,7 @@ def settings(tmp_path: Path) -> Settings:
         profile_dir=tmp_path / "p",
         debug_dir=tmp_path / "d",
         hash_cache_path=tmp_path / "h.json",
+        books_state_path=tmp_path / "books.json",
         concurrency=4,
         api_rps=2.0,
         http_timeout_s=5.0,
