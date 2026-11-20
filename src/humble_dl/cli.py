@@ -40,7 +40,6 @@ from humble_dl.lib.hashcache import HashCache
 from humble_dl.lib.logging import get_logger
 from humble_dl.models.library import SchemaDriftError
 from humble_dl.services.books import (
-    DEFAULT_BATCH,
     DEFAULT_PAUSE_S,
     BooksDeps,
     BooksError,
@@ -370,18 +369,15 @@ def books(
     only: Annotated[
         str | None, typer.Option("--only", help="Only bundles whose folder name contains TEXT.")
     ] = None,
-    batch: Annotated[
-        int, typer.Option("--batch", help="Files per Books launch (1-50).")
-    ] = DEFAULT_BATCH,
     pause: Annotated[
-        float, typer.Option("--pause", help="Seconds between batches (0-60).")
+        float, typer.Option("--pause", help="Seconds between files (0-60).")
     ] = DEFAULT_PAUSE_S,
 ) -> None:
     """Import one file per downloaded ebook into Apple Books (macOS)."""
 
     def body() -> None:
         settings = load_settings(os.environ, Path.home(), output_override=output)
-        opts = BooksOptions(dry_run=dry_run, only=only, batch=batch, pause=pause)
+        opts = BooksOptions(dry_run=dry_run, only=only, pause=pause)
         _report_books(import_books(settings, opts, BOOKS_DEPS()), dry_run)
 
     _run("books", body)

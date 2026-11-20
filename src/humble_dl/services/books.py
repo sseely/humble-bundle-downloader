@@ -1,8 +1,13 @@
 """Import downloaded ebooks into Apple Books (macOS) exactly once per file.
 
-Functional core: selection, classification against saved state and batching are
-pure. The shell (:func:`import_books`) only sequences effects: reading and
-writing the state file and invoking the injected runner and sleep.
+Functional core: selection, classification against saved state and new-entry
+detection are pure. The shell (:func:`import_books`) only sequences effects:
+reading and writing the state file, listing the library, and invoking the
+injected runner, clock and sleep.
+
+Files go to Books one per ``open`` call, and a file is recorded only after a new
+entry appears in Books' library folder: ``open`` exits 0 even when Books drops
+the file, which it did silently for batched opens.
 """
 
 import json
@@ -12,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
@@ -25,6 +30,7 @@ from humble_dl.services.books_library import (
     HIDDEN_PREFIX,
     PREFERRED_SUFFIXES,
     default_library_dir,
+    is_book_entry,
     keys_for_selection,
     library_keys,
     partition,
@@ -35,19 +41,22 @@ DARWIN = "darwin"
 OPEN_COMMAND = ("open", "-a", "Books")
 OPEN_TIMEOUT_S = 120.0
 
-DEFAULT_BATCH = 10
-MIN_BATCH = 1
-MAX_BATCH = 50
-DEFAULT_PAUSE_S = 5.0
+DEFAULT_PAUSE_S = 1.0
 MIN_PAUSE_S = 0.0
 MAX_PAUSE_S = 60.0
+# Observed imports land in 2-4 s; large PDFs take longer to copy.
+CONFIRM_TIMEOUT_S = 60.0
+CONFIRM_POLL_S = 0.5
 
 MSG_PLATFORM = "Apple Books import requires macOS."
 MSG_STATE_CORRUPT = (
     "Books state file {path} is unreadable or corrupt. Fix or delete it to continue; "
     "deleting it makes the next run re-import every book and create duplicates in Books."
 )
-MSG_BAD_BATCH = "--batch must be an integer in range {low}..{high}, got {value}."
+MSG_NO_LIBRARY = (
+    "Apple Books library folder {path} not found, so imports cannot be confirmed. "
+    "Turn on iCloud for Books, open Books once, then run again."
+)
 MSG_BAD_PAUSE = "--pause must be in range {low}..{high} seconds, got {value}."
 MSG_DRY_LINE = "{verb} {relative}"
 MSG_DRY_TOTAL = "Dry run: {count} files to import."
@@ -73,8 +82,12 @@ class BooksPlatformError(BooksError):
     """Apple Books import was requested on a platform other than macOS."""
 
 
+class BooksLibraryError(BooksError):
+    """Books' library folder is missing, so no import could be confirmed."""
+
+
 class BooksFailedError(BooksError):
-    """One or more batches failed to import; the message lists their files."""
+    """One or more files failed to import; the message lists them."""
 
 
 class FileStamp(BaseModel):
@@ -99,6 +112,7 @@ class Runner(Protocol):
 
 
 Sleeper = Callable[[float], None]
+Clock = Callable[[], float]
 
 
 def run_open(argv: Sequence[str]) -> bool:
@@ -122,8 +136,7 @@ class BooksOptions:
 
     dry_run: bool = False
     only: str | None = None
-    batch: int = DEFAULT_BATCH
-    pause: float = DEFAULT_PAUSE_S
+    pause: float = DEFAULT_PAUSE_S  # seconds between files
 
 
 @dataclass(frozen=True)
@@ -134,6 +147,9 @@ class BooksDeps:
     sleep: Sleeper = time.sleep
     platform: str = field(default_factory=lambda: sys.platform)
     library_dir: Path | None = None  # None: default_library_dir() at call time
+    clock: Clock = time.monotonic
+    confirm_timeout: float = CONFIRM_TIMEOUT_S  # wait for the library entry
+    poll: float = CONFIRM_POLL_S
 
 
 @dataclass(frozen=True)
@@ -174,13 +190,11 @@ class BooksReport:
 
 
 def validate_options(opts: BooksOptions) -> None:
-    """Check batch and pause ranges.
+    """Check the pause range.
 
     Raises:
-        ConfigError: If ``batch`` or ``pause`` is outside its allowed range.
+        ConfigError: If ``pause`` is outside its allowed range.
     """
-    if not MIN_BATCH <= opts.batch <= MAX_BATCH:
-        raise ConfigError(MSG_BAD_BATCH.format(low=MIN_BATCH, high=MAX_BATCH, value=opts.batch))
     if not MIN_PAUSE_S <= opts.pause <= MAX_PAUSE_S:
         raise ConfigError(MSG_BAD_PAUSE.format(low=MIN_PAUSE_S, high=MAX_PAUSE_S, value=opts.pause))
 
@@ -255,9 +269,9 @@ def classify(stamps: Mapping[Path, FileStamp], state: Mapping[str, FileStamp]) -
     return BooksPlan(tuple(new), tuple(changed), tuple(already), stamps)
 
 
-def chunk(paths: Sequence[Path], size: int) -> list[list[Path]]:
-    """Split ``paths`` into consecutive batches of at most ``size``."""
-    return [list(paths[i : i + size]) for i in range(0, len(paths), size)]
+def new_entries(before: Collection[str], after: Iterable[str]) -> list[str]:
+    """Book entries in ``after`` that were not in ``before``, sorted."""
+    return sorted(name for name in after if is_book_entry(name) and name not in before)
 
 
 def _skip_lines(verb: str, paths: Sequence[Path], output_dir: Path) -> list[str]:
@@ -314,23 +328,24 @@ def save_state(path: Path, state: Mapping[str, FileStamp]) -> None:
         raise
 
 
-def _import_batch(
-    batch: Sequence[Path],
-    plan: BooksPlan,
-    state: dict[str, FileStamp],
-    state_path: Path,
-    runner: Runner,
-) -> bool:
-    """Import one batch; on success record and persist its files."""
-    ok = runner([*OPEN_COMMAND, *(str(p) for p in batch)])
-    extra = {"count": len(batch), "ok": ok, FILE_NAME_KEY: batch[0].name}
-    if ok:
-        _log.info("books_batch", extra=extra)
-        state.update({str(p): plan.stamps[p] for p in batch})
-        save_state(state_path, state)
-    else:
-        _log.warning("books_batch", extra=extra)
-    return ok
+def _wait_for_entry(library: Path, before: Collection[str], deps: BooksDeps) -> bool:
+    """Poll the library until a new book entry appears or the timeout passes."""
+    deadline = deps.clock() + deps.confirm_timeout
+    while not new_entries(before, read_library_names(library)):
+        if deps.clock() >= deadline:
+            return False
+        deps.sleep(deps.poll)
+    return True
+
+
+def _import_one(path: Path, library: Path, deps: BooksDeps) -> bool:
+    """Send one file to Books; True once its new library entry appears."""
+    before = frozenset(read_library_names(library))
+    opened = deps.runner([*OPEN_COMMAND, str(path)])
+    confirmed = opened and _wait_for_entry(library, before, deps)
+    extra = {"opened": opened, "confirmed": confirmed, FILE_NAME_KEY: path.name}
+    (_log.info if confirmed else _log.warning)("books_file", extra=extra)
+    return confirmed
 
 
 def _import_all(
@@ -340,13 +355,17 @@ def _import_all(
     opts: BooksOptions,
     deps: BooksDeps,
 ) -> BooksReport:
+    library = deps.library_dir or default_library_dir()
     done: list[Path] = []
     failed: list[Path] = []
-    for index, batch in enumerate(chunk(plan.to_import, opts.batch)):
+    for index, path in enumerate(plan.to_import):
         if index and opts.pause > 0:
             deps.sleep(opts.pause)
-        ok = _import_batch(batch, plan, state, state_path, deps.runner)
-        (done if ok else failed).extend(batch)
+        confirmed = _import_one(path, library, deps)
+        if confirmed:
+            state[str(path)] = plan.stamps[path]
+            save_state(state_path, state)
+        (done if confirmed else failed).append(path)
     changed = set(plan.changed)
     reimported = sum(1 for p in done if p in changed)
     return BooksReport(
@@ -371,6 +390,14 @@ def _build_plan(
     return replace(plan, duplicates=tuple(duplicates), in_books=tuple(in_books))
 
 
+def _require_import_ready(deps: BooksDeps) -> None:
+    if deps.platform != DARWIN:
+        raise BooksPlatformError(MSG_PLATFORM)
+    library = deps.library_dir or default_library_dir()
+    if not library.is_dir():
+        raise BooksLibraryError(MSG_NO_LIBRARY.format(path=library))
+
+
 def import_books(
     settings: Settings, opts: BooksOptions, deps: BooksDeps | None = None
 ) -> BooksReport:
@@ -385,14 +412,15 @@ def import_books(
         The report; for a dry run ``lines`` holds the planned imports.
 
     Raises:
-        ConfigError: If batch or pause is out of range.
+        ConfigError: If pause is out of range.
         BooksPlatformError: If not a dry run and the platform is not macOS.
+        BooksLibraryError: If not a dry run and Books' library folder is missing.
         BooksStateError: If the state file is corrupt.
     """
     deps = deps or BooksDeps()
     validate_options(opts)
-    if not opts.dry_run and deps.platform != DARWIN:
-        raise BooksPlatformError(MSG_PLATFORM)
+    if not opts.dry_run:
+        _require_import_ready(deps)
     root = settings.output_dir.resolve()
     _log.info("books_started", extra={"dry_run": opts.dry_run, "only": opts.only})
     state = load_state(settings.books_state_path)

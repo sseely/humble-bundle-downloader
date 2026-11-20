@@ -75,9 +75,11 @@ uv run humble-dl sync && uv run humble-dl books   # download, then import new bo
   `~/.humble-dl/books-imported.json`, so a file is sent once. A changed file
   (a new version) is sent again.
 
-Files go to Books in batches (`--batch`, default 10) with a pause between them
-(`--pause`, default 5 s). Progress is saved after each batch. A failed batch is
-listed, makes the command exit 4, and is retried on the next run.
+Files go to Books one at a time, with a pause between them (`--pause`,
+default 1 s). A file counts as imported only once its new entry shows up in
+Books' library folder; `books` waits up to 60 s for it, then records it. A file
+that never appears is listed, makes the command exit 4, and is retried on the
+next run. (Sending several files per launch made Books silently drop some.)
 
 Books copies every imported file into its own library. With iCloud enabled for
 Books, imports also upload to iCloud and count against your storage.
