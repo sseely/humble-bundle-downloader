@@ -203,18 +203,18 @@ def _is_visible(path: Path) -> bool:
     return not path.name.startswith(HIDDEN_PREFIX)
 
 
-def _is_current(path: Path) -> bool:
+def is_current(path: Path) -> bool:
     """A visible regular file that is not an archived ``<stem>.<md5[:8]><suffix>``."""
     return path.is_file() and _is_visible(path) and not _ARCHIVED_STEM.search(path.stem)
 
 
-def _subdirs(path: Path) -> list[Path]:
+def subdirs(path: Path) -> list[Path]:
     return sorted(d for d in path.iterdir() if d.is_dir() and _is_visible(d))
 
 
-def _item_files(item: Path) -> list[Path]:
+def item_files(item: Path) -> list[Path]:
     """Current epubs if any, else current pdfs, else nothing."""
-    files = [f for f in item.iterdir() if _is_current(f)]
+    files = [f for f in item.iterdir() if is_current(f)]
     for suffix in PREFERRED_SUFFIXES:
         matching = [f for f in files if f.suffix.lower() == suffix]
         if matching:
@@ -236,11 +236,11 @@ def select_books(output_dir: Path, only: str | None = None) -> list[Path]:
         return []
     needle = only.casefold() if only else None
     selected: list[Path] = []
-    for bundle in _subdirs(output_dir):
+    for bundle in subdirs(output_dir):
         if needle is not None and needle not in bundle.name.casefold():
             continue
-        for item in _subdirs(bundle):
-            selected.extend(_item_files(item))
+        for item in subdirs(bundle):
+            selected.extend(item_files(item))
     return sorted(selected)
 
 

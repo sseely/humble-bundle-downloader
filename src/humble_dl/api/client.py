@@ -260,8 +260,7 @@ class LibraryClient:
             SchemaDriftError: A payload no longer matches the expected shape.
         """
         page_url = HUMBLE_BASE + library_detail_path(bundle_id)
-        flight = await self._flight(page_url)
-        order = self._parse(KIND_BUNDLE, flight, lambda text: parse_bundle(text, bundle_id))
+        order = await self.get_bundle(bundle_id)
         ids = [s.entitlement_id for s, _ in ebook_items(order) if s.entitlement_id]
         signed: dict[str, dict[str, str]] = {}
         for batch in batched(ids, SIGNED_URL_BATCH):
@@ -278,6 +277,18 @@ class LibraryClient:
                 },
             )
         return order, missing
+
+    async def get_bundle(self, bundle_id: str) -> Order:
+        """Return a bundle's order as listed on its page, without signed URLs.
+
+        Raises:
+            SessionExpiredError: Not logged in.
+            BotChallengeError: Cloudflare challenged the request.
+            LibraryApiError: Navigation failed.
+            SchemaDriftError: The page no longer matches the expected shape.
+        """
+        flight = await self._flight(HUMBLE_BASE + library_detail_path(bundle_id))
+        return self._parse(KIND_BUNDLE, flight, lambda text: parse_bundle(text, bundle_id))
 
     async def refresh(self, bundle_id: str) -> Order:
         """Re-fetch a bundle so its signed URLs are fresh."""

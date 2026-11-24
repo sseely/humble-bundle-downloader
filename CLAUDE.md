@@ -22,11 +22,18 @@ src/humble_dl/
   cli.py  config.py
   auth/session.py            headed persistent-profile login
   api/client.py api/capture.py   library JSON via browser context; fixtures
+  api/bookmeta.py            Comic Vine / Open Library writer lookups (httpx)
   models/library.py          pydantic models of the order API
-  lib/naming.py lib/logging.py lib/hashcache.py
-  services/planner.py services/sync.py
+  lib/naming.py lib/logging.py lib/hashcache.py lib/pdfmeta.py
+  services/planner.py services/sync.py services/titles.py
+  services/books.py services/books_library.py services/books_collections.py
+  services/book_info.py      Books retitles and writer matching (pure)
   workers/downloader.py      httpx streaming into .part files
 tests/   mirrors src; shared helpers and fixtures in tests/helpers/
+scripts/books_collections/   Books UI automation (pyobjc, `macos` group);
+                             run via ./books-collections.sh
+sync-books.sh                full pipeline: sync, titles, import, retitle,
+                             remove duplicates, collections
 ```
 
 ## Quality gates (all must pass before commit)
@@ -47,4 +54,7 @@ them with `uv run pytest -m live`.
   archives the old file as `<stem>.<md5[:8]><suffix>`.
 - The on-disk naming layout is a durable contract (naming snapshot tests).
 - Never log or commit cookies, raw gamekeys, emails, or signed URL queries.
+- The Comic Vine API key comes from `HUMBLE_DL_COMICVINE_API_KEY` (the
+  launcher reads the `humble-dl-comicvine` Keychain entry); never cache,
+  log, or commit it.
 - Tests never write to `~/HumbleBundle`.

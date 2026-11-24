@@ -29,6 +29,11 @@ dev = [
     "ruff==0.17.5",
     "pyright==1.1.414",
 ]
+macos = [
+    "pyobjc-framework-applicationservices==13.0 ; sys_platform == 'darwin'",
+    "pyobjc-framework-cocoa==13.0 ; sys_platform == 'darwin'",
+    "pyobjc-framework-quartz==13.0 ; sys_platform == 'darwin'",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -61,3 +66,9 @@ typeCheckingMode = "strict"
 pythonVersion = "3.13"
 venvPath = "."
 venv = ".venv"
+
+# Books collection scripts import their siblings and need pyobjc (no stubs);
+# the gated pyright run covers src/ and tests/ only.
+[[tool.pyright.executionEnvironments]]
+root = "scripts/books_collections"
+extraPaths = ["scripts/books_collections", "src"]

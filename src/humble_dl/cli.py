@@ -59,6 +59,7 @@ from humble_dl.services.sync import (
     fetch_of,
     run_sync,
 )
+from humble_dl.services.titles import BundleSource, fetch_titles, save_titles
 
 EXIT_OK = 0
 EXIT_CONFIG = 1
@@ -99,6 +100,7 @@ MSG_BOOKS_SUMMARY = (
     "already in Books {in_books}"
 )
 MSG_BOOKS_FAILED = "{count} file(s) failed to import into Books:"
+MSG_TITLES_SAVED = "Saved {count} title(s) to {path}."
 UNKNOWN_SIZE = "size unknown"
 VERB_FETCH = "fetch"
 VERB_REPLACE = "archive+fetch"
@@ -130,9 +132,11 @@ CaptureFn = Callable[[CaptureContext, Settings, Path], Awaitable[list[Path]]]
 SyncFn = Callable[[Settings, SyncOptions, SyncDeps], Awaitable[Summary]]
 AssertLoggedInFn = Callable[[SessionContext, Settings], Awaitable[None]]
 LibraryFactory = Callable[[BrowserLike, Settings], Awaitable[LibraryLike]]
+BundleSourceFactory = Callable[[BrowserLike, Settings], Awaitable[BundleSource]]
+FetchTitlesFn = Callable[[BundleSource, str | None], Awaitable[tuple[dict[str, str], list[str]]]]
 
 
-async def _make_library(ctx: BrowserLike, settings: Settings) -> LibraryLike:
+async def _make_library(ctx: BrowserLike, settings: Settings) -> LibraryClient:
     page = await ctx.new_page()
     return LibraryClient(cast("LibraryPage", page), settings)
 
@@ -145,6 +149,8 @@ PERSIST_COOKIES: PersistFn = persist_session_cookies
 RUN_SYNC: SyncFn = run_sync
 ASSERT_LOGGED_IN: AssertLoggedInFn = assert_logged_in
 MAKE_LIBRARY: LibraryFactory = _make_library
+MAKE_BUNDLES: BundleSourceFactory = _make_library
+FETCH_TITLES: FetchTitlesFn = fetch_titles
 BOOKS_DEPS: Callable[[], BooksDeps] = BooksDeps
 
 # Most specific first: BotChallengeError subclasses SessionExpiredError.
@@ -325,6 +331,33 @@ def sync(
         _report_sync(summary, settings, opts)
 
     _run("sync", body)
+
+
+async def _titles(settings: Settings, only: str | None) -> tuple[dict[str, str], list[str]]:
+    # Headed, like sync: Cloudflare is less likely to challenge a visible browser.
+    async with OPEN_CONTEXT(settings, headed=True) as ctx:
+        await ASSERT_LOGGED_IN(ctx, settings)
+        return await FETCH_TITLES(await MAKE_BUNDLES(ctx, settings), only)
+
+
+@app.command()
+def titles(
+    only: Annotated[
+        str | None, typer.Option("--only", help="Only bundles whose title contains TEXT.")
+    ] = None,
+) -> None:
+    """Save Humble's exact item titles (for relabelling books in Apple Books)."""
+
+    def body() -> None:
+        settings = load_settings(os.environ, Path.home())
+        found, failed = asyncio.run(_titles(settings, only))
+        save_titles(settings.titles_path, found)
+        typer.echo(MSG_TITLES_SAVED.format(count=len(found), path=settings.titles_path))
+        if failed:
+            listing = "\n".join(f"  {title}" for title in failed)
+            raise SyncFailedError(f"{MSG_FAILED_BUNDLES.format(count=len(failed))}\n{listing}")
+
+    _run("titles", body)
 
 
 def _report_books(report: BooksReport, dry_run: bool) -> None:

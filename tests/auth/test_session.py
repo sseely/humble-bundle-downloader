@@ -63,6 +63,7 @@ def make_settings(tmp_path: Path) -> Settings:
         debug_dir=tmp_path / "debug",
         hash_cache_path=tmp_path / "hc.json",
         books_state_path=tmp_path / "books.json",
+        titles_path=tmp_path / "titles.json",
         concurrency=1,
         api_rps=1.0,
         http_timeout_s=HTTP_TIMEOUT_S,

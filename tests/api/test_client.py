@@ -206,6 +206,16 @@ async def test_no_ebooks_makes_no_action_call(
     assert len(missing) == 22
 
 
+async def test_get_bundle_parses_without_signing(settings: Settings, fake_time: FakeTime) -> None:
+    page = bundle_page()
+    order = await make(page, settings, fake_time).get_bundle(BUNDLE_ID)
+    titles = {s.human_name for s in order.subproducts}
+    assert "The Kaiju Preservation Society" in titles
+    assert order.human_name.startswith("Humble Book Bundle: The John Scalzi Collection")
+    assert page.action_calls == []
+    assert page.chunk_fetches == 0
+
+
 async def test_refresh_returns_order(settings: Settings, fake_time: FakeTime) -> None:
     order = await make(bundle_page(), settings, fake_time).refresh(BUNDLE_ID)
     assert order.gamekey == BUNDLE_ID

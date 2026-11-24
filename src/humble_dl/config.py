@@ -13,6 +13,7 @@ PROFILE_DIR_NAME = "profile"
 DEBUG_DIR_NAME = "debug"
 HASH_CACHE_FILE_NAME = "hash-cache.json"
 BOOKS_STATE_FILE_NAME = "books-imported.json"
+TITLES_FILE_NAME = "titles.json"
 
 DEFAULT_CONCURRENCY = 4
 MIN_CONCURRENCY = 1
@@ -36,6 +37,7 @@ class Settings:
     debug_dir: Path
     hash_cache_path: Path
     books_state_path: Path
+    titles_path: Path
     concurrency: int
     api_rps: float
     http_timeout_s: float
@@ -83,6 +85,7 @@ def load_settings(
         debug_dir=state / DEBUG_DIR_NAME,
         hash_cache_path=state / HASH_CACHE_FILE_NAME,
         books_state_path=state / BOOKS_STATE_FILE_NAME,
+        titles_path=state / TITLES_FILE_NAME,
         concurrency=_parse_concurrency(env),
         api_rps=DEFAULT_API_RPS,
         http_timeout_s=DEFAULT_HTTP_TIMEOUT_S,

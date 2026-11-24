@@ -87,6 +87,137 @@ Books, imports also upload to iCloud and count against your storage.
 `books-duplicates` only reports. To remove an extra copy, use the Books app:
 right-click the book, then choose **Remove**, then **Remove Everywhere**.
 
+### Everything in one go
+
+```bash
+./sync-books.sh          # asks before retitling and before deleting copies
+./sync-books.sh --yes    # unattended
+```
+
+It runs every step below in order: download (`humble-dl sync`), Humble titles
+(`humble-dl titles`), import into Books (`humble-dl books`), plan titles,
+authors and duplicates (`books-collections.sh --info`), retitle (`--rename`),
+delete duplicate copies (`--remove`), then file books into collections. Books
+are retitled and duplicates deleted before collections are planned, so each
+book is filed under its final title and no copy about to be deleted is filed.
+Before the retitle and delete steps it shows how many entries each will change
+and the file to review (`book_info.json`, `remove.json`). A step that finishes
+with some files failed or some books left over (for example books stored only
+in iCloud) is reported at the end and the run continues; anything else stops
+it. The Books steps need Books in front and the Mac left alone.
+
+### One collection per bundle
+
+`books` imports books but does not sort them into collections. Run
+`books-collections.sh` from the repository root after importing:
+
+```bash
+uv run humble-dl books && ./books-collections.sh   # import, then file into collections
+./books-collections.sh --plan                       # scan and plan only; changes nothing
+```
+
+Each book goes into a Books collection named after its bundle folder (for
+example "Humble Comics Bundle - Example Comics
+by Oni Press"). A book that appears in several bundles goes into each of their
+collections. Books that match no bundle go into **My Books**. Missing
+collections are created.
+
+Apple Books has no scripting support for collections, so the script uses the
+Books app itself through macOS accessibility. It right-clicks each book and
+chooses **Add to Collection**. It never writes Books' database.
+
+- **Permissions:** the terminal app needs **Accessibility** permission
+  (System Settings → Privacy & Security → Accessibility).
+- **Keep Books in front:** Books ignores the script unless it is the frontmost
+  app. The script stops if another app takes focus or the screen locks, and
+  keeps the Mac awake while it runs (`caffeinate`). Don't use the Mac until it
+  finishes.
+- **Key presses:** to name a new collection, the script pastes the name with
+  ⌘V and presses Return, both sent to Books only. Your clipboard is restored
+  afterwards.
+- **Re-run at any time:** every add is recorded in
+  `~/.humble-dl/collections/progress.json`. A re-run skips books that are
+  already in their collections, even when their reading progress has
+  changed. Set `HUMBLE_DL_COLLECTIONS_DIR` to keep that state somewhere else.
+- **Duplicates:** when Books holds a book under both its title and its file
+  name (`rickandmorty_vol1`), only the titled copy is filed. The file-named
+  copies are listed in `duplicates.json` in the same folder.
+- **Safety checks:** before each add, the script compares every collection's
+  book count with what it expects. On a mismatch (for example, you changed a
+  collection while it ran) it stops without changing anything else.
+
+It runs three scripts from `scripts/books_collections/`: `scan.py` records
+every entry in the Books library list, `plan.py` matches entries to bundle
+folders, and `run_pass.py` makes the adds. They need the `macos` dependency
+group, which `books-collections.sh` loads with `uv run --group macos`.
+
+### Readable titles and authors
+
+Books titles a PDF that carries no metadata after its file name
+(`rickandmortypresents_vol5`) and shows "Unknown Author". Two steps fix that:
+
+```bash
+uv run humble-dl titles                # save Humble's exact item titles
+./books-collections.sh --info          # scan Books, look up titles and authors; changes nothing
+./books-collections.sh --rename        # apply them in Books
+```
+
+- **Titles:** `humble-dl titles` saves each item's title as Humble lists it
+  (`Rick and Morty: Worlds Apart`, colons and all) to
+  `~/.humble-dl/titles.json`. File-named entries get that title. Entries that
+  match no Humble item, and file-named copies of a book Books already holds
+  under its title, are left alone and listed in `book_info_skipped.json` and
+  `duplicates.json`.
+- **Authors:** every entry showing "Unknown Author" gets writer credits from
+  [Comic Vine](https://comicvine.gamespot.com/api/), matched by series name,
+  issue or volume number, the publisher in the bundle name ("by Oni Press")
+  and the year in the PDF's metadata. Without a Comic Vine match, the first
+  contributor [Open Library](https://openlibrary.org) lists is used; that
+  can be an artist, so check those. Entries with no match keep "Unknown
+  Author".
+- **Review first:** `--info` only writes `book_info.json` (in
+  `~/.humble-dl/collections/`): each entry's new title, author, and where the
+  author came from. Edit or delete entries there before running `--rename`.
+- **Comic Vine key:** get a free key at https://comicvine.gamespot.com/api/
+  (log in first) and store it in the Keychain, where `--info` reads it:
+  `security add-generic-password -a "$USER" -s humble-dl-comicvine -w`.
+  Without a key, only Open Library is used. Responses are cached in
+  `lookup_cache.json`; the key is never written to disk.
+- **What `--rename` does:** right-click → **Rename** opens Books' Book Info
+  sheet; the script fills in Title and Author and presses OK. Books also
+  renames the book's file in its iCloud folder. Each rename is recorded in
+  `renamed.json` and the book's collection progress follows it, so re-runs
+  skip finished entries and `books-collections.sh` won't add the book again.
+  The same rules as collections apply: Books in front, hands off the Mac.
+- **Your own titles:** for entries Humble has no title for (for example old
+  2014 copies such as `RedSonjaVol1-03HQ_1418163538`), write them in
+  `~/.humble-dl/collections/title_overrides.json`, keyed by the Books label
+  without its reading status: `{"RedSonjaVol1-03HQ_1418163538, Unknown
+  Author": {"title": "Red Sonja (2005) #3", "author": "Michael Avon Oeming &
+  Mike Carey"}}`. Overrides win over lookups. Mark an extra copy with
+  `{"duplicate_of": "<the copy you keep>"}` to have it removed instead.
+- **Books stored only in iCloud:** Books offers no **Rename** for a book that
+  isn't downloaded (its label ends in "In iCloud"). `--rename` skips those and
+  lists them at the end; download them in Books, then run `--rename` again.
+
+### Remove duplicate copies
+
+`--info` also writes `remove.json`: every file-named copy of a book Books
+already holds under its title (`purgatori_issue3` next to `Purgatori #3`), plus
+overrides marked `duplicate_of`, each with the copy that is kept. Review it,
+then:
+
+```bash
+./books-collections.sh --remove
+```
+
+For each listed copy, the script right-clicks → **Remove…**, presses
+**Delete Everywhere** and answers Books' "Delete from iCloud?" with **Delete**,
+which deletes that copy from iCloud on all your devices.
+The kept copy is not touched. It checks that the entry left the library before
+moving on and stops on anything unexpected. Removals are recorded in
+`removed.json`, so re-runs skip them.
+
 ## Folder layout
 
 For the bundle "Humble Book Bundle: The John Scalzi Collection: Old Man's

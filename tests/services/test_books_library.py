@@ -192,3 +192,22 @@ def test_item_title_keys_add_numbered_series_prefix(
 ) -> None:
     path = tmp_path / "Bundle" / item / "file.pdf"
     assert lib.book_keys(path, include_item=True) == {"file"} | expected_extra
+
+
+@pytest.mark.parametrize(
+    "renamed",
+    [
+        "Rick and Morty Presents Vol. 5.pdf",  # live 2026-11-24 after Book Info rename
+        "Rick and Morty Presents: Vol. 5.pdf",
+    ],
+)
+def test_books_renamed_entry_still_counts_as_in_books(tmp_path: Path, renamed: str) -> None:
+    # Retitling an entry in Books renames its iCloud file after the new title,
+    # so a downloaded file must still match through its item-folder title.
+    path = tmp_path / "Bundle" / "Rick and Morty Presents Vol. 5" / "rickandmortypresents_vol5.pdf"
+    path.parent.mkdir(parents=True)
+    path.write_text("x")
+    keys = lib.keys_for_selection([path])
+    names = [renamed, "rickandmortypresents_vol4.pdf"]
+    remaining, _, in_books = lib.partition([path], keys, lib.library_keys(names))
+    assert (remaining, in_books) == ([], [path])

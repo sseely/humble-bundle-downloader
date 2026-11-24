@@ -32,6 +32,7 @@ from humble_dl.services.sync import (
     SyncDeps,
     SyncOptions,
 )
+from humble_dl.services.titles import BundleSource
 from tests.helpers.books import FakeBooks
 
 ENV_CONCURRENCY = "HUMBLE_DL_CONCURRENCY"
@@ -585,3 +586,65 @@ def test_books_missing_library_exits_1(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert result.exit_code == cli.EXIT_CONFIG
     assert "imports cannot be confirmed" in result.stderr
     assert rec.calls == []
+
+
+class TitlesRecorder:
+    """Fakes for the titles seams."""
+
+    def __init__(
+        self, titles: dict[str, str] | None = None, failed: list[str] | None = None
+    ) -> None:
+        self.titles = titles if titles is not None else {"B/Item": "Item: Sub"}
+        self.failed = failed or []
+        self.only: list[str | None] = []
+        self.checked: list[object] = []
+        self.source = cast("BundleSource", object())
+        self.sources: list[BundleSource] = []
+
+    async def assert_logged_in(self, ctx: SessionContext, settings: Settings) -> None:
+        self.checked.append(ctx)
+
+    async def make_bundles(self, ctx: cli.BrowserLike, settings: Settings) -> BundleSource:
+        return self.source
+
+    async def fetch(
+        self, source: BundleSource, only: str | None
+    ) -> tuple[dict[str, str], list[str]]:
+        self.sources.append(source)
+        self.only.append(only)
+        return self.titles, self.failed
+
+
+def install_titles(monkeypatch: pytest.MonkeyPatch, rec: Recorder, titles: TitlesRecorder) -> None:
+    install(monkeypatch, rec)
+    monkeypatch.setattr(cli, "ASSERT_LOGGED_IN", titles.assert_logged_in)
+    monkeypatch.setattr(cli, "MAKE_BUNDLES", titles.make_bundles)
+    monkeypatch.setattr(cli, "FETCH_TITLES", titles.fetch)
+
+
+def test_titles_saves_merged_titles_and_reports(
+    monkeypatch: pytest.MonkeyPatch, isolated_home: Path
+) -> None:
+    rec, titles = Recorder(), TitlesRecorder()
+    install_titles(monkeypatch, rec, titles)
+    saved = isolated_home / ".humble-dl" / "titles.json"
+    saved.parent.mkdir()
+    saved.write_text(json.dumps({"A/Old": "Old"}), encoding="utf-8")
+    result = invoke("titles", "--only", "rick")
+    assert result.exit_code == cli.EXIT_OK
+    assert rec.headed == [True]
+    assert titles.checked == [FAKE_CTX]
+    assert titles.sources == [titles.source]
+    assert titles.only == ["rick"]
+    assert json.loads(saved.read_text(encoding="utf-8")) == {"A/Old": "Old", "B/Item": "Item: Sub"}
+    assert f"Saved 1 title(s) to {saved}." in result.stdout
+
+
+def test_titles_failed_bundle_exits_4_after_saving(
+    monkeypatch: pytest.MonkeyPatch, isolated_home: Path
+) -> None:
+    install_titles(monkeypatch, Recorder(), TitlesRecorder(failed=["Broken Bundle"]))
+    result = invoke("titles")
+    assert result.exit_code == cli.EXIT_FILES
+    assert "1 bundle(s) could not be loaded:\n  Broken Bundle" in result.stderr
+    assert (isolated_home / ".humble-dl" / "titles.json").exists()
