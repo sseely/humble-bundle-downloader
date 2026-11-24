@@ -10,6 +10,8 @@ Only ebooks are downloaded. Games, audio, video and keys are ignored.
 
 - macOS or Linux, Python 3.13, [uv](https://docs.astral.sh/uv/)
 - A Humble Bundle account
+- Optional, for writer credits on comics in Apple Books: a free
+  [Comic Vine API key](#comic-vine-api-key) (macOS only)
 
 ## Install
 
@@ -104,7 +106,9 @@ Before the retitle and delete steps it shows how many entries each will change
 and the file to review (`book_info.json`, `remove.json`). A step that finishes
 with some files failed or some books left over (for example books stored only
 in iCloud) is reported at the end and the run continues; anything else stops
-it. The Books steps need Books in front and the Mac left alone.
+it. The Books steps need Books in front and the Mac left alone. Set up a
+[Comic Vine API key](#comic-vine-api-key) first to get writer credits for
+comics.
 
 ### One collection per bundle
 
@@ -178,11 +182,9 @@ uv run humble-dl titles                # save Humble's exact item titles
 - **Review first:** `--info` only writes `book_info.json` (in
   `~/.humble-dl/collections/`): each entry's new title, author, and where the
   author came from. Edit or delete entries there before running `--rename`.
-- **Comic Vine key:** get a free key at https://comicvine.gamespot.com/api/
-  (log in first) and store it in the Keychain, where `--info` reads it:
-  `security add-generic-password -a "$USER" -s humble-dl-comicvine -w`.
-  Without a key, only Open Library is used. Responses are cached in
-  `lookup_cache.json`; the key is never written to disk.
+- **Comic Vine key:** needed for Comic Vine lookups; see
+  [Comic Vine API key](#comic-vine-api-key). Without one, only Open Library
+  is used.
 - **What `--rename` does:** right-click → **Rename** opens Books' Book Info
   sheet; the script fills in Title and Author and presses OK. Books also
   renames the book's file in its iCloud folder. Each rename is recorded in
@@ -199,6 +201,40 @@ uv run humble-dl titles                # save Humble's exact item titles
 - **Books stored only in iCloud:** Books offers no **Rename** for a book that
   isn't downloaded (its label ends in "In iCloud"). `--rename` skips those and
   lists them at the end; download them in Books, then run `--rename` again.
+
+### Comic Vine API key
+
+Writer credits for comics come from [Comic Vine](https://comicvine.gamespot.com),
+which needs a free personal API key. Set it up once:
+
+1. Create an account at https://comicvine.gamespot.com and log in.
+2. Open https://comicvine.gamespot.com/api/ in the same browser. Your key is
+   shown there, under "Grab an API key". It is not on your account or
+   profile pages, and logged out the page only says you must log in.
+3. Store the key in your macOS Keychain. This prompts for it without echoing:
+
+   ```bash
+   security add-generic-password -a "$USER" -s humble-dl-comicvine -w
+   ```
+
+4. Check it is there (prints the entry, not the key):
+
+   ```bash
+   security find-generic-password -s humble-dl-comicvine
+   ```
+
+`books-collections.sh --info` (and `sync-books.sh`) read the key from the
+Keychain each run and pass it to the lookup as `HUMBLE_DL_COMICVINE_API_KEY`;
+setting that variable yourself overrides the Keychain. The run prints
+`HUMBLE_DL_COMICVINE_API_KEY: set` or `not set (Open Library only)`.
+
+- **Without a key** everything still works; authors come from Open Library
+  only, which finds fewer comics.
+- **The key stays secret:** it is never written to disk, logged, or cached.
+  Responses are cached in `~/.humble-dl/collections/lookup_cache.json` without
+  it, so re-runs make no new requests. Lookups are spaced one second apart.
+- **To replace the key**, delete the entry and add it again:
+  `security delete-generic-password -s humble-dl-comicvine`.
 
 ### Remove duplicate copies
 
@@ -281,6 +317,8 @@ planned files and stops without writing anything if it does not.
 |----------|---------|---------|
 | `HUMBLE_DL_CONCURRENCY` | `4` | Parallel file downloads (1–32) |
 | `HUMBLE_DL_PROFILE_DIR` | `~/.humble-dl/profile` | Browser profile holding the session |
+| `HUMBLE_DL_COMICVINE_API_KEY` | Keychain entry `humble-dl-comicvine` | [Comic Vine API key](#comic-vine-api-key) for writer credits |
+| `HUMBLE_DL_COLLECTIONS_DIR` | `~/.humble-dl/collections` | State and review files of the Books scripts |
 
 ## Troubleshooting
 
